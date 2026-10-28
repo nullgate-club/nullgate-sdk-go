@@ -28,42 +28,58 @@ BaseURL: previewURL, AnalyticsURL: analyticsURL})`, check its error, and
 document; reuse the identity UUID and your target provider's cookie jar across
 navigation, not session state.
 
+With a discovered `sensor`, its fetched `script` and the target's current
+`cookies`, a single generation is shown below. `target` is your `tls-client`
+client and `http` is `github.com/bogdanfinn/fhttp`.
+
 ```go
-package example
-
-import (
-	"context"
-
-	nullgate "github.com/nullgate-club/nullgate-sdk-go"
-)
-
-func generateSensor(
-	ctx context.Context,
-	client *nullgate.Client,
-	identity, userAgent string,
-	sensor nullgate.Sensor,
-	script string,
-	cookies map[string]string,
-) (*nullgate.Solution, error) {
-	session, err := client.Open(nullgate.SessionOptions{
-		Identity: identity, UserAgent: userAgent,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer session.Close()
-
-	return session.Solve(ctx, nullgate.SensorParams{
-		Protection: sensor, Script: script, Cookies: cookies,
-	})
+session, err := client.Open(nullgate.SessionOptions{
+	Identity: identity, UserAgent: userAgent,
+})
+if err != nil {
+	return err
 }
+defer session.Close()
+
+solution, err := session.Solve(ctx, nullgate.SensorParams{
+	Protection: sensor, Script: script, Cookies: cookies,
+})
+if err != nil {
+	return err
+}
+if err := solution.Wait(ctx); err != nil {
+	return err
+}
+post, err := http.NewRequestWithContext(
+	ctx, solution.Method, solution.URL, strings.NewReader(solution.Body),
+)
+if err != nil {
+	return err
+}
+for name, value := range solution.Headers {
+	post.Header.Set(name, value)
+}
+target.SetFollowRedirect(false)
+response, err := target.Do(post)
+if err != nil {
+	return err
+}
+defer response.Body.Close()
+fmt.Println(response.StatusCode)
 ```
 
-`nullgate.FindProtections(nullgate.Page{URL: pageURL, HTML: html})` performs local
-synchronous discovery and returns candidates plus an error. Select the intended
-concrete `nullgate.Sensor`, `nullgate.Pixel` or `nullgate.Sbsd` explicitly when
-ambiguous; fetch its `ScriptURL` with your target client. Discovery does not fetch
-scripts or execute JavaScript, and a candidate is not proof of a supported source.
+`nullgate.FindProtections(page)` and `client.FindProtections(page)` perform local,
+synchronous discovery. Zero matches return an empty list; one returns a
+single-element list. Multiple matches return `*nullgate.AmbiguousProtectionError`
+with a `Count` field. These functions return normal errors; they never invoke Go
+`panic`.
+
+Call `nullgate.FindProtections(page, false)` (or the client method with `false`)
+to inspect every original candidate and its provenance, then select the intended
+concrete `nullgate.Sensor`, `nullgate.Pixel` or `nullgate.Sbsd` yourself. No
+candidate is silently selected or deduplicated. Fetch its `ScriptURL` with your
+target client. Discovery does not fetch scripts or execute JavaScript, and a
+candidate is not proof of a supported source.
 
 Use `PixelParams{Protection: pixel, Script: script}` or
 `SbsdParams{Protection: sbsd, Script: script, Cookies: cookies}` for the other
@@ -89,10 +105,12 @@ sessions and reports are finished.
 
 ## Runnable target example
 
-[examples/target/main.go](examples/target/main.go) uses `tls-client` with its
-Chrome 146 profile, a matching Windows User-Agent, persistent connections and a
-scope-aware cookie jar. It fetches page/script content, solves, waits and posts
-the exact body; it has no standard-transport fallback.
+[examples/target/main.go](examples/target/main.go) is a sequential, one-generation
+program using `tls-client`'s Chrome 146 profile, a matching Windows User-Agent and
+its native cookie jar and `GetCookies` API. It performs one page GET, local
+discovery, one script GET, one solve, the scheduled wait and one exact POST, then
+prints the target response. It has no transport fallback, automatic generation
+loop or custom cookie adapter.
 
 ```sh
 git clone https://github.com/nullgate-club/nullgate-sdk-go.git
@@ -102,11 +120,16 @@ export NULLGATE_API_KEY='your-account-key'
 go run ./examples/target
 ```
 
-Optional environment variables are `NULLGATE_IDENTITY`, `TARGET_PROXY`,
-`NULLGATE_BASE_URL` and `ANALYTICS_URL`; configure the last two for the updated
-preview deployment before backend cutover. A closed sensor cookie gate is not
-proof of target acceptance. Blocking SBSD is checked by re-fetching the original
-page, not by treating POST 200 as clearance. Verify your intended target content.
+`NULLGATE_IDENTITY` optionally supplies a stable identity UUID; otherwise the
+example generates one. `NULLGATE_BASE_URL` and `ANALYTICS_URL` select the updated
+preview services before backend cutover.
+
+One POST demonstrates one generation, not target clearance. If your target needs
+another generation on the same document, reuse the session and refresh cookies
+from the target client before solving again. After navigation, open a new
+session; keep the identity and target cookie jar. For blocking SBSD, revisit the
+original page and check the intended content rather than treating POST 200 as
+clearance.
 
 ## Develop
 
@@ -119,4 +142,4 @@ make check
 Standalone CI runs `make setup` and `make check`, using the Go version in
 `go.mod`. The gate checks `gofmt`, runs `go vet ./...`, and runs the behavioral
 suite with `go test -race ./...`, including compilation of the target example.
-Canonical SDK-first documentation: [docs.nullgate.club](https://docs.nullgate.club).
+Canonical SDK-first documentation: [Quickstart](https://docs.nullgate.club/en/quickstart).

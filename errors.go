@@ -8,6 +8,16 @@ import (
 // ErrClosed indicates a closed session or client.
 var ErrClosed = errors.New("nullgate: client or session is closed")
 
+// AmbiguousProtectionError means discovery found more than one candidate.
+// Pass false to FindProtections to inspect every candidate and its provenance.
+type AmbiguousProtectionError struct {
+	Count int
+}
+
+func (e *AmbiguousProtectionError) Error() string {
+	return fmt.Sprintf("nullgate: found %d protection candidates; use FindProtections(page, false) to inspect and select explicitly", e.Count)
+}
+
 // APIError retains the original service status, parsed detail and request ID.
 // Its default rendering deliberately omits the detail, which can contain
 // caller-supplied content. Inspect Detail explicitly when appropriate.

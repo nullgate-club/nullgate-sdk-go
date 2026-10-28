@@ -21,10 +21,11 @@ type discoveredChallenge struct {
 	offset int
 }
 
-// FindProtections parses only the supplied HTML. It retains every script
-// occurrence and possible pixel challenge in document order, without fetching
-// or executing anything. Unknown .js/.mjs/.cjs frontend assets are not sensors.
-func FindProtections(page Page) ([]Protection, error) {
+// FindProtections parses only the supplied HTML, without fetching or executing
+// anything. Unknown .js/.mjs/.cjs frontend assets are not sensors. More than one
+// candidate returns AmbiguousProtectionError by default; pass false to retain all
+// occurrences and possible pixel challenges in document order. It never panics.
+func FindProtections(page Page, panicOnAmbiguity ...bool) ([]Protection, error) {
 	if err := validatePage(page); err != nil {
 		return nil, err
 	}
@@ -84,12 +85,15 @@ func FindProtections(page Page) ([]Protection, error) {
 			found = append(found, Sensor{Page: page, ScriptURL: source.String(), Provenance: &ref})
 		}
 	}
+	if len(found) > 1 && (len(panicOnAmbiguity) == 0 || panicOnAmbiguity[0]) {
+		return nil, &AmbiguousProtectionError{Count: len(found)}
+	}
 	return found, nil
 }
 
 // FindProtections is local even when called on a closed Client.
-func (c *Client) FindProtections(page Page) ([]Protection, error) {
-	return FindProtections(page)
+func (c *Client) FindProtections(page Page, panicOnAmbiguity ...bool) ([]Protection, error) {
+	return FindProtections(page, panicOnAmbiguity...)
 }
 
 func sameOrigin(a, b *url.URL) bool {

@@ -1,6 +1,7 @@
 package nullgate_test
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,7 +14,7 @@ func TestDiscoveryRetainsPixelAmbiguityAndProvenance(t *testing.T) {
 		`<script src="/akam/13/ab?x=1&amp;y=2#drop"></script>` + "\n" +
 		`<script src="/akam/13/ab?x=1&amp;y=2#drop"></script>`
 	page := nullgate.Page{URL: "https://target.example/login", HTML: html}
-	found, err := nullgate.FindProtections(page)
+	found, err := nullgate.FindProtections(page, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +43,66 @@ func TestDiscoveryRetainsPixelAmbiguityAndProvenance(t *testing.T) {
 		if p.ChallengeOffset == nil || *p.ChallengeOffset != strings.Index(html, needle) {
 			t.Errorf("candidate %d did not retain the first challenge occurrence", i)
 		}
+	}
+}
+
+func TestDiscoveryAmbiguityPolicy(t *testing.T) {
+	client, err := nullgate.NewClient(apiKey, nullgate.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+
+	page := nullgate.Page{
+		URL:  "https://target.example/login",
+		HTML: "<script src=\"/first\"></script>\n<script src=\"/second\"></script>",
+	}
+	want := []nullgate.Protection{
+		nullgate.Sensor{Page: page, ScriptURL: "https://target.example/first", Provenance: &nullgate.ScriptReference{RawSource: "/first", TagIndex: 0, Line: 1, Column: 0}},
+		nullgate.Sensor{Page: page, ScriptURL: "https://target.example/second", Provenance: &nullgate.ScriptReference{RawSource: "/second", TagIndex: 1, Line: 2, Column: 0}},
+	}
+	for _, discover := range []struct {
+		name string
+		find func(nullgate.Page, ...bool) ([]nullgate.Protection, error)
+	}{
+		{"package", nullgate.FindProtections},
+		{"closed client", client.FindProtections},
+	} {
+		t.Run(discover.name, func(t *testing.T) {
+			for _, args := range [][]bool{nil, {true}} {
+				found, err := discover.find(page, args...)
+				var ambiguous *nullgate.AmbiguousProtectionError
+				if !errors.As(err, &ambiguous) {
+					t.Fatalf("wanted typed ambiguity error, got %v", err)
+				}
+				if ambiguous.Count != 2 || found != nil {
+					t.Fatalf("ambiguity returned count %d and candidates %#v", ambiguous.Count, found)
+				}
+			}
+			found, err := discover.find(page, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(found, want) {
+				t.Fatalf("opt-out changed candidates or provenance: %#v", found)
+			}
+			for _, count := range []int{0, 1} {
+				page := nullgate.Page{
+					URL:  "https://target.example/login",
+					HTML: strings.Repeat(`<script src="/only"></script>`, count),
+				}
+				found, err := discover.find(page)
+				if err != nil || found == nil || len(found) != count {
+					t.Fatalf("%d candidates returned %#v, %v", count, found, err)
+				}
+				if count == 1 {
+					p, ok := found[0].(nullgate.Sensor)
+					if !ok || p.Page != page || p.ScriptURL != "https://target.example/only" {
+						t.Fatal("single candidate lost its page or script URL")
+					}
+				}
+			}
+		})
 	}
 }
 
