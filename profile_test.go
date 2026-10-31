@@ -66,6 +66,7 @@ func profileTarget(t *testing.T, fetch nullgate.TargetFetch) nullgate.Target {
 
 func TestProfileConcurrentBinaryHTTPAndExplicitDeparture(t *testing.T) {
 	unblockSlow, collect := make(chan struct{}), make(chan struct{})
+	closed := make(chan error, 1)
 	_, session := profileSession(t, func(conn *websocket.Conn) {
 		requests := []string{
 			`{"type":"http","id":1,"request":{"role":"slow","url":"https://target.example/slow","method":"POST","headers":{},"body":"AP+A","credentials":"include"}}`,
@@ -143,6 +144,8 @@ func TestProfileConcurrentBinaryHTTPAndExplicitDeparture(t *testing.T) {
 		if err := conn.ReadJSON(&final); err != nil || final["type"] != "close" {
 			t.Error("Close did not terminate explicitly, or invented a pagehide")
 		}
+		_, _, err = conn.ReadMessage()
+		closed <- err
 	})
 	target := profileTarget(t, func(ctx context.Context, request nullgate.TargetRequest) (nullgate.TargetResponse, error) {
 		switch request.Role {
@@ -190,6 +193,17 @@ func TestProfileConcurrentBinaryHTTPAndExplicitDeparture(t *testing.T) {
 	}
 	if err := profile.Pagehide(ctx, nil, false); err != nil {
 		t.Fatal(err)
+	}
+	if err := profile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			t.Fatalf("explicit Close did not send a normal WebSocket close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("server did not observe the explicit WebSocket close")
 	}
 }
 

@@ -346,6 +346,13 @@ func (p *Profile) stop(err error) {
 		p.mu.Unlock()
 		p.cancel()
 		if conn != nil {
+			if errors.Is(err, ErrClosed) {
+				_ = conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+					time.Now().Add(time.Second),
+				)
+			}
 			conn.Close()
 		}
 	})

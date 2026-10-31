@@ -178,6 +178,7 @@ have no correlation ID.
 
 `Close`, session close, client close, or cancellation of the context originally
 passed to `Profile` release network work without inventing pagehide.
+Explicit `Close` sends a normal WebSocket close frame before closing the connection.
 `Done()` closes after cleanup; `Err()` exposes typed `APIError`, `ProtocolError`
 or `TransportError` (including source `RequestID`) or cancellation.
 Target callbacks must stop on their context so cleanup can join them.
