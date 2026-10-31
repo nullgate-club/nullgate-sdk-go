@@ -22,13 +22,16 @@ type discoveredChallenge struct {
 }
 
 // FindProtections parses only the supplied HTML, without fetching or executing
-// anything. Unknown .js/.mjs/.cjs frontend assets are not sensors. More than one
+// anything. Unknown .js/.mjs/.cjs frontend assets are not sensors. Cross-origin
+// tags.js is recognized only with one nonempty org_id and session_id each. More than one
 // candidate returns AmbiguousProtectionError by default; pass false to retain all
 // occurrences and possible pixel challenges in document order. It never panics.
 func FindProtections(page Page, panicOnAmbiguity ...bool) ([]Protection, error) {
-	if err := validatePage(page); err != nil {
+	observed, err := observePage(page, websitePayload{})
+	if err != nil {
 		return nil, err
 	}
+	page.DocumentID, page.StartedAtMS = observed.DocumentID, &observed.StartedAtMS
 	document, _ := url.Parse(page.URL)
 	sources, challenges, baseHref := parseScripts(page.HTML)
 	base := document
@@ -46,10 +49,14 @@ func FindProtections(page Page, panicOnAmbiguity ...bool) ([]Protection, error) 
 		}
 		source := base.ResolveReference(relative)
 		source.Fragment, source.RawFragment = "", ""
+		ref := reference
+		if isThreatMetrixTags(source) {
+			found = append(found, ThreatMetrix{Page: page, TagsURL: source.String(), Provenance: &ref})
+			continue
+		}
 		if !sameOrigin(document, source) {
 			continue
 		}
-		ref := reference
 		if pixelPath.MatchString(source.Path) {
 			for _, challenge := range challenges {
 				offset := challenge.offset
@@ -94,6 +101,25 @@ func FindProtections(page Page, panicOnAmbiguity ...bool) ([]Protection, error) 
 // FindProtections is local even when called on a closed Client.
 func (c *Client) FindProtections(page Page, panicOnAmbiguity ...bool) ([]Protection, error) {
 	return FindProtections(page, panicOnAmbiguity...)
+}
+
+func isThreatMetrixTags(source *url.URL) bool {
+	if source.Hostname() == "" || source.User != nil ||
+		(source.Scheme != "http" && source.Scheme != "https") ||
+		!strings.HasSuffix(source.Path, "/tags.js") {
+		return false
+	}
+	query, err := url.ParseQuery(source.RawQuery)
+	if err != nil {
+		return false
+	}
+	for _, name := range []string{"org_id", "session_id"} {
+		values := query[name]
+		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func sameOrigin(a, b *url.URL) bool {

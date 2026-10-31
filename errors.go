@@ -37,10 +37,15 @@ func (e *APIError) GoString() string { return e.Error() }
 type ProtocolError struct {
 	Problem   string
 	RequestID string
+	Operation string
 }
 
 func (e *ProtocolError) Error() string {
-	return fmt.Sprintf("nullgate: invalid generation response: %s (request_id=%s)", e.Problem, e.RequestID)
+	operation := e.Operation
+	if operation == "" {
+		operation = "generation"
+	}
+	return fmt.Sprintf("nullgate: invalid %s response: %s (request_id=%s)", operation, e.Problem, e.RequestID)
 }
 func (e *ProtocolError) GoString() string { return e.Error() }
 
@@ -49,8 +54,14 @@ func (e *ProtocolError) GoString() string { return e.Error() }
 type TransportError struct {
 	Operation string
 	Err       error
+	RequestID string
 }
 
-func (e *TransportError) Error() string    { return "nullgate: " + e.Operation + " transport failed" }
+func (e *TransportError) Error() string {
+	if e.RequestID != "" {
+		return fmt.Sprintf("nullgate: %s transport failed (request_id=%s)", e.Operation, e.RequestID)
+	}
+	return "nullgate: " + e.Operation + " transport failed"
+}
 func (e *TransportError) Unwrap() error    { return e.Err }
 func (e *TransportError) GoString() string { return e.Error() }

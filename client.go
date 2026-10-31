@@ -20,29 +20,34 @@ import (
 )
 
 const (
-	DefaultBaseURL      = "https://akamai.nullgate.club"
-	DefaultAnalyticsURL = "https://analytics.nullgate.club"
-	reportTimeout       = 3 * time.Second
+	DefaultBaseURL        = "https://akamai.nullgate.club"
+	DefaultProfileBaseURL = "https://threatmetrix.nullgate.club"
+	DefaultAnalyticsURL   = "https://analytics.nullgate.club"
+	reportTimeout         = 3 * time.Second
 )
 
 // Options configures only the Nullgate API, never the target website transport.
 // HTTPClient is copied, with redirects and its cookie jar disabled. Its
 // RoundTripper remains caller-owned and must be safe for concurrent requests.
 type Options struct {
-	BaseURL      string
-	AnalyticsURL string
-	HTTPClient   *http.Client
+	BaseURL        string
+	ProfileBaseURL string
+	AnalyticsURL   string
+	HTTPClient     *http.Client
 }
 
 // Client owns a reusable API transport. Sessions keep their state independently.
 // Use defer client.Close(); closing a client does not close a supplied transport.
 type Client struct {
-	apiKey        string
-	baseURL       string
-	analyticsURL  string
-	http          *http.Client
-	ownsTransport bool
-	closed        atomic.Bool
+	apiKey         string
+	baseURL        string
+	profileBaseURL string
+	analyticsURL   string
+	http           *http.Client
+	ownsTransport  bool
+	closed         atomic.Bool
+	profilesMu     sync.Mutex
+	profiles       map[*Profile]struct{}
 }
 
 func (c *Client) String() string   { return "nullgate.Client{APIKey:<redacted>}" }
@@ -59,6 +64,9 @@ func NewClient(apiKey string, options Options) (*Client, error) {
 	if options.AnalyticsURL == "" {
 		options.AnalyticsURL = DefaultAnalyticsURL
 	}
+	if options.ProfileBaseURL == "" {
+		options.ProfileBaseURL = DefaultProfileBaseURL
+	}
 	base, err := apiBase(options.BaseURL)
 	if err != nil {
 		return nil, errors.New("nullgate: BaseURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
@@ -66,6 +74,10 @@ func NewClient(apiKey string, options Options) (*Client, error) {
 	analytics, err := apiBase(options.AnalyticsURL)
 	if err != nil {
 		return nil, errors.New("nullgate: AnalyticsURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	}
+	profileBase, err := apiBase(options.ProfileBaseURL)
+	if err != nil {
+		return nil, errors.New("nullgate: ProfileBaseURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
 	}
 	var api http.Client
 	ownsTransport := false
@@ -80,7 +92,10 @@ func NewClient(apiKey string, options Options) (*Client, error) {
 	}
 	api.Jar = nil
 	api.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{apiKey: apiKey, baseURL: base, analyticsURL: analytics, http: &api, ownsTransport: ownsTransport}, nil
+	return &Client{
+		apiKey: apiKey, baseURL: base, profileBaseURL: profileBase, analyticsURL: analytics,
+		http: &api, ownsTransport: ownsTransport,
+	}, nil
 }
 
 func apiBase(raw string) (string, error) {
@@ -110,8 +125,9 @@ type Session struct {
 	gate      chan struct{}
 	mu        sync.Mutex
 	stateID   string
-	hasState  bool
+	document  websitePayload
 	closed    bool
+	profiles  map[*Profile]struct{}
 }
 
 func (s *Session) String() string   { return "nullgate.Session{State:<redacted>}" }
@@ -134,7 +150,14 @@ func (c *Client) Open(options SessionOptions) (*Session, error) {
 		value := *options.Timezone
 		timezone = &value
 	}
-	return &Session{client: c, identity: identity.String(), userAgent: options.UserAgent, timezone: timezone, gate: make(chan struct{}, 1)}, nil
+	state, err := uuid.NewRandom()
+	if err != nil {
+		return nil, errors.New("nullgate: could not create session state")
+	}
+	return &Session{
+		client: c, identity: identity.String(), userAgent: options.UserAgent,
+		timezone: timezone, gate: make(chan struct{}, 1), stateID: state.String(),
+	}, nil
 }
 
 // Solve calls only Nullgate. It neither sends to the target nor retries a
@@ -156,12 +179,12 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 		return nil, err
 	}
 	s.mu.Lock()
-	stateID, hasState, closed := s.stateID, s.hasState, s.closed
+	stateID, previous, closed := s.stateID, s.document, s.closed
 	s.mu.Unlock()
 	if closed || s.client.closed.Load() {
 		return nil, ErrClosed
 	}
-	operation, payload, target, err := generationPayload(params, s.timezone)
+	operation, payload, target, err := generationPayload(params, s.timezone, previous)
 	if err != nil {
 		return nil, err
 	}
@@ -175,12 +198,20 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 		return nil, &TransportError{Operation: "generate", Err: err}
 	}
 	request.GetBody = nil // Do not replay a failed POST on a reused connection.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.closed || s.client.closed.Load() {
+		s.mu.Unlock()
+		return nil, ErrClosed
+	}
+	s.document = payload.Website
+	s.mu.Unlock()
 	request.Header.Set("Authorization", "Bearer "+s.client.apiKey)
 	request.Header.Set("User-Agent", s.userAgent)
 	request.Header.Set("Content-Type", "application/json")
-	if hasState {
-		request.Header.Set("X-State-ID", stateID)
-	}
+	request.Header.Set("X-State-ID", stateID)
 	response, err := s.client.http.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -195,7 +226,6 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 		if len(values) > 0 {
 			s.stateID = values[0]
 		}
-		s.hasState = true
 	}
 	closed = s.closed
 	s.mu.Unlock()
@@ -215,19 +245,42 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 	return normalizeSolution(response, data, operation, target, s.client)
 }
 
-// Close discards this stream's state. It is safe to call repeatedly and does
-// not close the client. In-flight requests remain governed by their contexts.
+// Close discards this stream's state and closes its active profiles. It does
+// not close the client or change cancellation of in-flight Solve requests.
 func (s *Session) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed, s.hasState, s.stateID = true, false, ""
+	s.closed, s.stateID, s.document = true, "", websitePayload{}
+	profiles := make([]*Profile, 0, len(s.profiles))
+	for profile := range s.profiles {
+		profiles = append(profiles, profile)
+	}
+	s.mu.Unlock()
+	for _, profile := range profiles {
+		profile.stop(ErrClosed)
+	}
+	for _, profile := range profiles {
+		<-profile.done
+	}
 	return nil
 }
 
-// Close prevents new API calls and closes owned idle connections. Cancel the
-// caller's contexts to stop active requests. Caller-supplied pools stay open.
+// Close prevents new API calls and closes active profiles and owned idle
+// connections. Caller-supplied pools stay open; Solve keeps its caller context.
 func (c *Client) Close() error {
-	if !c.closed.Swap(true) && c.ownsTransport {
+	c.profilesMu.Lock()
+	alreadyClosed := c.closed.Swap(true)
+	profiles := make([]*Profile, 0, len(c.profiles))
+	for profile := range c.profiles {
+		profiles = append(profiles, profile)
+	}
+	c.profilesMu.Unlock()
+	for _, profile := range profiles {
+		profile.stop(ErrClosed)
+	}
+	for _, profile := range profiles {
+		<-profile.done
+	}
+	if !alreadyClosed && c.ownsTransport {
 		c.http.CloseIdleConnections()
 	}
 	return nil

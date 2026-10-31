@@ -75,11 +75,13 @@ func TestMalformedSuccessIsProtocolErrorAndStillRotatesState(t *testing.T) {
 }
 
 func TestMissingStateHeaderRetainsAnExplicitEmptyRotation(t *testing.T) {
-	seen := make(chan bool, 3)
+	states := make(chan string, 3)
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, present := r.Header[http.CanonicalHeaderKey("X-State-ID")]
-		seen <- present
+		if _, present := r.Header[http.CanonicalHeaderKey("X-State-ID")]; !present {
+			t.Error("state header was absent")
+		}
+		states <- r.Header.Get("X-State-ID")
 		if calls == 0 {
 			w.Header().Set("X-State-ID", "")
 		}
@@ -93,8 +95,8 @@ func TestMissingStateHeaderRetainsAnExplicitEmptyRotation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if <-seen || !<-seen || !<-seen {
-		t.Error("an explicit empty rotation was conflated with an absent state header")
+	if <-states == "" || <-states != "" || <-states != "" {
+		t.Error("an explicit empty rotation was not retained after local state creation")
 	}
 }
 
@@ -114,6 +116,17 @@ func TestInvalidParamsFailBeforeNetwork(t *testing.T) {
 	} {
 		if _, err := session.Solve(context.Background(), params); err == nil {
 			t.Errorf("accepted invalid params of type %T", params)
+		}
+	}
+	startedAtMS := int64(0)
+	for _, invalidPage := range []nullgate.Page{
+		{URL: page.URL, DocumentID: identity},
+		{URL: page.URL, StartedAtMS: &startedAtMS},
+		{URL: page.URL, DocumentID: "not-a-uuid", StartedAtMS: &startedAtMS},
+	} {
+		params := nullgate.SensorParams{Protection: nullgate.Sensor{Page: invalidPage, ScriptURL: sensor.ScriptURL}, Script: "source"}
+		if _, err := session.Solve(context.Background(), params); err == nil {
+			t.Error("accepted an incomplete or invalid document observation")
 		}
 	}
 }

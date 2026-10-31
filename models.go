@@ -1,5 +1,5 @@
-// Package nullgate discovers supported Akamai protections locally and prepares
-// target POSTs through the Nullgate API. Target HTTP and cookies stay caller-owned.
+// Package nullgate discovers supported protections locally, prepares Akamai
+// target POSTs, and runs active ThreatMetrix profiles. Target HTTP stays caller-owned.
 package nullgate
 
 import (
@@ -7,12 +7,19 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
-// Page is the original URL and HTML supplied by the caller.
+// Page retains the caller's original document. Discovery assigns one observation
+// to all protections; DocumentID and StartedAtMS may also be supplied together.
+// Literal pages without observations reuse a session-local context for equal
+// URL and HTML. Fresh discovery or a new session distinguishes identical pages.
 type Page struct {
-	URL  string
-	HTML string
+	URL         string
+	HTML        string
+	DocumentID  string
+	StartedAtMS *int64
 }
 
 func (p Page) String() string   { return "nullgate.Page{HTML:<redacted>}" }
@@ -77,6 +84,35 @@ func (Sbsd) Provider() string   { return "akamai" }
 func (Sbsd) protection()        {}
 func (Sbsd) String() string     { return "nullgate.Sbsd{Page:<redacted>}" }
 func (p Sbsd) GoString() string { return p.String() }
+
+// ThreatMetrix retains the actual tags URL and the document that loaded it.
+type ThreatMetrix struct {
+	Page       Page
+	TagsURL    string
+	Provenance *ScriptReference
+}
+
+func (ThreatMetrix) Kind() string     { return "threatmetrix" }
+func (ThreatMetrix) Provider() string { return "threatmetrix" }
+func (ThreatMetrix) protection()      {}
+func (ThreatMetrix) String() string {
+	return "nullgate.ThreatMetrix{Page:<redacted>, TagsURL:<redacted>}"
+}
+func (p ThreatMetrix) GoString() string { return p.String() }
+
+// ThreatMetrixParams is used only by Session.Profile, not Solve. Inputs and
+// Actions use the same observations as SensorParams. Nil omits a collection;
+// a non-nil empty slice explicitly clears it.
+type ThreatMetrixParams struct {
+	Protection ThreatMetrix
+	Inputs     []Input
+	Actions    []Action
+}
+
+func (ThreatMetrixParams) String() string {
+	return "nullgate.ThreatMetrixParams{Protection:<redacted>}"
+}
+func (p ThreatMetrixParams) GoString() string { return p.String() }
 
 // Blocking checks presence of the raw t parameter, including t=; it does not
 // decode parameter names or infer blocking from any other part of the URL.
@@ -157,6 +193,14 @@ func absoluteHTTPURL(raw string) (*url.URL, error) {
 func validatePage(page Page) error {
 	if _, err := absoluteHTTPURL(page.URL); err != nil {
 		return fmt.Errorf("Page.URL: %w", err)
+	}
+	if (page.DocumentID == "") != (page.StartedAtMS == nil) {
+		return errors.New("nullgate: Page.DocumentID and Page.StartedAtMS must be supplied together")
+	}
+	if page.DocumentID != "" {
+		if _, err := uuid.Parse(page.DocumentID); err != nil {
+			return errors.New("nullgate: Page.DocumentID must be a UUID")
+		}
 	}
 	return nil
 }

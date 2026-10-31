@@ -1,10 +1,17 @@
 package nullgate
 
-import "errors"
+import (
+	"errors"
+	"time"
+
+	"github.com/google/uuid"
+)
 
 type websitePayload struct {
-	URL  string `json:"url"`
-	HTML string `json:"html"`
+	URL         string `json:"url"`
+	HTML        string `json:"html"`
+	DocumentID  string `json:"document_id"`
+	StartedAtMS int64  `json:"started_at_ms"`
 }
 
 type scriptPayload struct {
@@ -22,7 +29,26 @@ type generatePayload struct {
 	Actions   *[]Action          `json:"actions,omitempty"`
 }
 
-func generationPayload(params Params, timezone *string) (operation string, payload generatePayload, target string, err error) {
+func observePage(page Page, previous websitePayload) (websitePayload, error) {
+	if err := validatePage(page); err != nil {
+		return websitePayload{}, err
+	}
+	observed := websitePayload{URL: page.URL, HTML: page.HTML}
+	if page.DocumentID != "" {
+		observed.DocumentID, observed.StartedAtMS = page.DocumentID, *page.StartedAtMS
+	} else if previous.DocumentID != "" && previous.URL == page.URL && previous.HTML == page.HTML {
+		observed.DocumentID, observed.StartedAtMS = previous.DocumentID, previous.StartedAtMS
+	} else {
+		id, err := uuid.NewRandom()
+		if err != nil {
+			return websitePayload{}, errors.New("nullgate: could not create document observation")
+		}
+		observed.DocumentID, observed.StartedAtMS = id.String(), time.Now().UnixMilli()
+	}
+	return observed, nil
+}
+
+func generationPayload(params Params, timezone *string, previous websitePayload) (operation string, payload generatePayload, target string, err error) {
 	var page Page
 	payload.Timezone = timezone
 	switch p := params.(type) {
@@ -30,17 +56,17 @@ func generationPayload(params Params, timezone *string) (operation string, paylo
 		if p == nil {
 			return "", payload, "", errors.New("nullgate: PixelParams must not be nil")
 		}
-		return generationPayload(*p, timezone)
+		return generationPayload(*p, timezone, previous)
 	case *SensorParams:
 		if p == nil {
 			return "", payload, "", errors.New("nullgate: SensorParams must not be nil")
 		}
-		return generationPayload(*p, timezone)
+		return generationPayload(*p, timezone, previous)
 	case *SbsdParams:
 		if p == nil {
 			return "", payload, "", errors.New("nullgate: SbsdParams must not be nil")
 		}
-		return generationPayload(*p, timezone)
+		return generationPayload(*p, timezone, previous)
 	case PixelParams:
 		operation, page, target = "pixel", p.Protection.Page, p.Protection.ScriptURL
 		payload.Script.Text, payload.Challenge = p.Script, p.Protection.Challenge
@@ -65,12 +91,8 @@ func generationPayload(params Params, timezone *string) (operation string, paylo
 			payload.Inputs = &inputs
 		}
 		if p.Actions != nil {
-			for _, action := range p.Actions {
-				if action["type"] == "input" || action["type"] == "change" {
-					if _, raw := action["value"].(string); raw {
-						return "", payload, "", errors.New("nullgate: input/change action values must be prepared InputValue summaries, not raw strings")
-					}
-				}
+			if err := validateActions(p.Actions); err != nil {
+				return "", payload, "", err
 			}
 			payload.Actions = &p.Actions
 		}
@@ -85,16 +107,16 @@ func generationPayload(params Params, timezone *string) (operation string, paylo
 	default:
 		return "", payload, "", errors.New("nullgate: Solve requires PixelParams, SensorParams, or SbsdParams")
 	}
-	if err := validatePage(page); err != nil {
-		return "", payload, "", err
-	}
 	if _, err := absoluteHTTPURL(target); err != nil {
 		return "", payload, "", errors.New("nullgate: Protection.ScriptURL must be an absolute HTTP(S) URL")
 	}
 	if payload.Script.Text == "" {
 		return "", payload, "", errors.New("nullgate: Script must contain the source text")
 	}
-	payload.Website = websitePayload{URL: page.URL, HTML: page.HTML}
+	payload.Website, err = observePage(page, previous)
+	if err != nil {
+		return "", payload, "", err
+	}
 	payload.Script.Source = target
 	return operation, payload, target, nil
 }

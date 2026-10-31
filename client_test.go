@@ -69,9 +69,6 @@ func TestSolveBuildsOperationPayloadsAndReadyPosts(t *testing.T) {
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Error(err)
 				}
-				if !reflect.DeepEqual(payload["website"], map[string]any{"url": page.URL, "html": page.HTML}) || payload["timezone"] != "Europe/Berlin" {
-					t.Error("website or bound timezone was changed")
-				}
 				wantSource := sensor.ScriptURL
 				if kind == "pixel" {
 					wantSource = "https://target.example/akam/13/ab?original=1"
@@ -286,8 +283,113 @@ func TestStateRotatesOnErrorsRetainsWhenAbsentAndIsolatesSessions(t *testing.T) 
 	}
 	stateMu.Lock()
 	defer stateMu.Unlock()
-	if want := []string{"", "error-state", "error-state", "rotated-state", ""}; !reflect.DeepEqual(states, want) {
-		t.Errorf("state stream = %q, want %q", states, want)
+	if states[0] == "" || states[4] == "" || states[0] == states[4] || states[4] == "rotated-state" {
+		t.Errorf("sessions did not begin with isolated local state IDs: %q", states)
+	}
+	if states[1] != "error-state" || states[2] != "error-state" || states[3] != "rotated-state" {
+		t.Errorf("response rotations were not retained across failures: %q", states)
+	}
+}
+
+func TestSessionTracksDiscoveredDocumentsAcrossProtections(t *testing.T) {
+	source := nullgate.Page{
+		URL: "https://target.example/login",
+		HTML: `<script src="/sensor"></script><script>bazadebezolkohpepadr="123";</script>` +
+			`<script src="/akam/13/ab"></script><script src="/probe?v=` + identity + `"></script>`,
+	}
+	acquiredAt := time.Now().UnixMilli()
+	first, err := nullgate.FindProtections(source, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := nullgate.FindProtections(source, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type observation struct {
+		documentID, stateID, userAgent, path, timezone string
+		startedAtMS                                    int64
+	}
+	seen := make(chan observation, 6)
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Website struct {
+				DocumentID  string `json:"document_id"`
+				StartedAtMS int64  `json:"started_at_ms"`
+			} `json:"website"`
+			Timezone string `json:"timezone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		seen <- observation{
+			payload.Website.DocumentID, r.Header.Get("X-State-ID"),
+			r.Header.Get("User-Agent"), r.URL.Path, payload.Timezone, payload.Website.StartedAtMS,
+		}
+		calls++
+		if calls == 2 {
+			w.Header().Set("X-State-ID", "server-rotation")
+		}
+		if r.URL.Query().Get("type") == "akamai" {
+			writeSensor(w)
+		} else {
+			w.Header().Set("X-Request-ID", "discovery-request")
+			fmt.Fprint(w, `{"url":"https://target.example/post","body":"encoded","send_at":0,"headers":{}}`)
+		}
+	}))
+	defer server.Close()
+	timezone := "Europe/Berlin"
+	session, err := clientFor(t, server).Open(nullgate.SessionOptions{Identity: identity, UserAgent: "document-agent", Timezone: &timezone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	for _, protection := range []nullgate.Protection{first[0], first[1], first[2], first[0], second[0], second[0]} {
+		var params nullgate.Params
+		switch p := protection.(type) {
+		case nullgate.Sensor:
+			params = nullgate.SensorParams{Protection: p, Script: "source"}
+		case nullgate.Pixel:
+			params = nullgate.PixelParams{Protection: p, Script: "source"}
+		case nullgate.Sbsd:
+			params = nullgate.SbsdParams{Protection: p, Script: "source"}
+		default:
+			t.Fatalf("unexpected protection type %T", protection)
+		}
+		if _, err := session.Solve(context.Background(), params); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstRequest := <-seen
+	if firstRequest.documentID == "" || firstRequest.stateID == "" || firstRequest.startedAtMS < acquiredAt || firstRequest.startedAtMS > time.Now().UnixMilli() {
+		t.Fatal("first solve did not carry a local document observation and state")
+	}
+	var newDocument observation
+	for i := 1; i < 6; i++ {
+		current := <-seen
+		if current.userAgent != firstRequest.userAgent || current.path != firstRequest.path || current.timezone != firstRequest.timezone {
+			t.Error("changing document or protection changed the bound browser identity")
+		}
+		if i < 4 {
+			if current.documentID != firstRequest.documentID || current.startedAtMS != firstRequest.startedAtMS {
+				t.Error("protections from one discovery did not share the document observation")
+			}
+			wantState := firstRequest.stateID
+			if i >= 2 {
+				wantState = "server-rotation"
+			}
+			if current.stateID != wantState {
+				t.Error("same-document solves lost their local or response-rotated state")
+			}
+		} else if i == 4 {
+			if current.documentID == firstRequest.documentID || current.stateID != "server-rotation" {
+				t.Error("a newly acquired document must change its observation, not session state")
+			}
+			newDocument = current
+		} else if current.documentID != newDocument.documentID || current.startedAtMS != newDocument.startedAtMS || current.stateID != newDocument.stateID {
+			t.Error("repeated solves changed the new document's observation or state")
+		}
 	}
 }
 

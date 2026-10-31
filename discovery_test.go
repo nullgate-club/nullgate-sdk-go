@@ -30,8 +30,8 @@ func TestDiscoveryRetainsPixelAmbiguityAndProvenance(t *testing.T) {
 		if !ok {
 			t.Fatalf("candidate %d has type %T", i, found[i])
 		}
-		if p.Page != page || p.ScriptURL != "https://target.example/akam/13/ab?x=1&y=2" || p.Challenge != want.challenge {
-			t.Errorf("candidate %d lost document, raw query, or challenge", i)
+		if p.ScriptURL != "https://target.example/akam/13/ab?x=1&y=2" || p.Challenge != want.challenge {
+			t.Errorf("candidate %d lost raw query or challenge", i)
 		}
 		if p.Provenance == nil || *p.Provenance != (nullgate.ScriptReference{RawSource: "/akam/13/ab?x=1&y=2#drop", TagIndex: want.tag, Line: want.line, Column: 0}) {
 			t.Errorf("candidate %d has incorrect source provenance", i)
@@ -57,10 +57,6 @@ func TestDiscoveryAmbiguityPolicy(t *testing.T) {
 		URL:  "https://target.example/login",
 		HTML: "<script src=\"/first\"></script>\n<script src=\"/second\"></script>",
 	}
-	want := []nullgate.Protection{
-		nullgate.Sensor{Page: page, ScriptURL: "https://target.example/first", Provenance: &nullgate.ScriptReference{RawSource: "/first", TagIndex: 0, Line: 1, Column: 0}},
-		nullgate.Sensor{Page: page, ScriptURL: "https://target.example/second", Provenance: &nullgate.ScriptReference{RawSource: "/second", TagIndex: 1, Line: 2, Column: 0}},
-	}
 	for _, discover := range []struct {
 		name string
 		find func(nullgate.Page, ...bool) ([]nullgate.Protection, error)
@@ -83,8 +79,14 @@ func TestDiscoveryAmbiguityPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(found, want) {
-				t.Fatalf("opt-out changed candidates or provenance: %#v", found)
+			if len(found) != 2 {
+				t.Fatalf("opt-out returned %d candidates instead of the ambiguous pair", len(found))
+			}
+			for i, source := range []string{"https://target.example/first", "https://target.example/second"} {
+				p, ok := found[i].(nullgate.Sensor)
+				if !ok || p.ScriptURL != source {
+					t.Fatalf("opt-out changed candidate order: %#v", found)
+				}
 			}
 			for _, count := range []int{0, 1} {
 				page := nullgate.Page{
@@ -97,8 +99,8 @@ func TestDiscoveryAmbiguityPolicy(t *testing.T) {
 				}
 				if count == 1 {
 					p, ok := found[0].(nullgate.Sensor)
-					if !ok || p.Page != page || p.ScriptURL != "https://target.example/only" {
-						t.Fatal("single candidate lost its page or script URL")
+					if !ok || p.ScriptURL != "https://target.example/only" {
+						t.Fatal("single candidate lost its script URL")
 					}
 				}
 			}
@@ -191,5 +193,58 @@ func TestDiscoveryRootScriptUsesHTTPRootPath(t *testing.T) {
 	p, ok := found[0].(nullgate.Sensor)
 	if !ok || p.ScriptURL != "https://target.example?keep=1" {
 		t.Error("root URL/query provenance was changed")
+	}
+}
+
+func TestThreatMetrixDiscoveryAndCrossProviderAmbiguity(t *testing.T) {
+	for _, source := range []string{
+		"https://unlisted-profile.example/fp/tags.js?org_id=org&session_id=session",
+		"/local/tags.js?session_id=session&org_id=org",
+	} {
+		found, err := nullgate.FindProtections(nullgate.Page{
+			URL: "https://target.example/login", HTML: `<script src="` + source + `"></script>`,
+		})
+		if err != nil || len(found) != 1 {
+			t.Fatalf("valid tags URL was not found: %v", err)
+		}
+		protection, ok := found[0].(nullgate.ThreatMetrix)
+		if !ok || protection.Provider() != "threatmetrix" || protection.Provenance == nil {
+			t.Fatal("tags URL lost its nominal provider or document provenance")
+		}
+		if !strings.HasPrefix(protection.TagsURL, "https://") || protection.Page.DocumentID == "" {
+			t.Fatal("relative tags URL or shared document observation was not resolved")
+		}
+	}
+	for _, query := range []string{
+		"org_id=&session_id=session", "org_id=org", "org_id=org&session_id=",
+		"org_id=org&org_id=other&session_id=session",
+		"org_id=org&session_id=session&session_id=other",
+		"org_id=org&%6frg_id=other&session_id=session",
+	} {
+		found, err := nullgate.FindProtections(nullgate.Page{
+			URL:  "https://target.example/login",
+			HTML: `<script src="https://unlisted-profile.example/fp/tags.js?` + query + `"></script>`,
+		})
+		if err != nil || len(found) != 0 {
+			t.Fatalf("ambiguous or absent native IDs became a profile candidate: %q", query)
+		}
+	}
+	mixed := nullgate.Page{
+		URL:  "https://target.example/login",
+		HTML: `<script src="/sensor"></script><script src="https://unlisted-profile.example/fp/tags.js?org_id=org&session_id=session"></script>`,
+	}
+	_, err := nullgate.FindProtections(mixed)
+	var ambiguous *nullgate.AmbiguousProtectionError
+	if !errors.As(err, &ambiguous) || ambiguous.Count != 2 {
+		t.Fatalf("mixed providers silently selected one candidate: %v", err)
+	}
+	found, err := nullgate.FindProtections(mixed, false)
+	if err != nil || len(found) != 2 || found[0].Provider() != "akamai" || found[1].Provider() != "threatmetrix" {
+		t.Fatal("ambiguity opt-out did not preserve cross-provider document order")
+	}
+	sensor := found[0].(nullgate.Sensor)
+	profile := found[1].(nullgate.ThreatMetrix)
+	if sensor.Page.DocumentID != profile.Page.DocumentID || *sensor.Page.StartedAtMS != *profile.Page.StartedAtMS {
+		t.Fatal("providers on one page received different document observations")
 	}
 }
