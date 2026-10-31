@@ -14,6 +14,12 @@ type Command struct {
 	Type string `json:"type"`
 }
 
+type Collector struct {
+	URL       string `json:"url"`
+	OrgID     string `json:"org_id"`
+	SessionID string `json:"session_id"`
+}
+
 type Hello struct {
 	Type      string `json:"type"`
 	StateID   string `json:"state_id"`

@@ -15,13 +15,14 @@ import (
 )
 
 type profileStart struct {
-	Type     string           `json:"type"`
-	AtMS     int64            `json:"at_ms"`
-	Website  websitePayload   `json:"website"`
-	TagsURL  string           `json:"tags_url"`
-	Timezone *string          `json:"timezone"`
-	Inputs   *[]PreparedInput `json:"inputs,omitempty"`
-	Actions  *[]Action        `json:"actions,omitempty"`
+	Type      string                 `json:"type"`
+	AtMS      int64                  `json:"at_ms"`
+	Website   websitePayload         `json:"website"`
+	TagsURL   string                 `json:"tags_url,omitempty"`
+	Collector *profilewire.Collector `json:"collector,omitempty"`
+	Timezone  *string                `json:"timezone"`
+	Inputs    *[]PreparedInput       `json:"inputs,omitempty"`
+	Actions   *[]Action              `json:"actions,omitempty"`
 }
 
 type profileOperation struct {

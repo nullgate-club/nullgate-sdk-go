@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/nullgate-club/nullgate-sdk-go/internal/profilewire"
 )
 
 // Page retains the caller's original document. Discovery assigns one observation
@@ -85,20 +88,53 @@ func (Sbsd) protection()        {}
 func (Sbsd) String() string     { return "nullgate.Sbsd{Page:<redacted>}" }
 func (p Sbsd) GoString() string { return p.String() }
 
-// ThreatMetrix retains the actual tags URL and the document that loaded it.
+// ThreatMetrix retains a tags entry or an explicitly constructed direct collector.
 type ThreatMetrix struct {
 	Page       Page
 	TagsURL    string
 	Provenance *ScriptReference
+	collector  *profilewire.Collector
 }
 
 func (ThreatMetrix) Kind() string     { return "threatmetrix" }
 func (ThreatMetrix) Provider() string { return "threatmetrix" }
 func (ThreatMetrix) protection()      {}
 func (ThreatMetrix) String() string {
-	return "nullgate.ThreatMetrix{Page:<redacted>, TagsURL:<redacted>}"
+	return "nullgate.ThreatMetrix{Page:<redacted>, TagsURL:<redacted>, Collector:<redacted>}"
 }
 func (p ThreatMetrix) GoString() string { return p.String() }
+
+// NewThreatMetrixCollector retains the caller's exact collector URL and explicit
+// IDs. It performs no requests or script discovery.
+func NewThreatMetrixCollector(page Page, collectorURL, orgID, sessionID string) (ThreatMetrix, error) {
+	if err := validatePage(page); err != nil {
+		return ThreatMetrix{}, err
+	}
+	address, err := absoluteHTTPURL(collectorURL)
+	if err != nil || address.User != nil || strings.ContainsAny(collectorURL, "\\#") ||
+		strings.IndexFunc(collectorURL, unicode.IsSpace) >= 0 {
+		return ThreatMetrix{}, errors.New("nullgate: collector URL must be absolute HTTP(S) without userinfo, fragments, whitespace or backslashes")
+	}
+	if strings.Contains(address.Hostname(), ":") && !strings.HasPrefix(address.Host, "[") {
+		return ThreatMetrix{}, errors.New("nullgate: collector URL must have a valid host")
+	}
+	if port := address.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return ThreatMetrix{}, errors.New("nullgate: collector URL has an invalid port")
+		}
+	} else if strings.HasSuffix(address.Host, ":") {
+		return ThreatMetrix{}, errors.New("nullgate: collector URL has an invalid port")
+	}
+	if strings.TrimSpace(orgID) == "" || strings.TrimSpace(sessionID) == "" ||
+		strings.ContainsAny(orgID, "\r\n") || strings.ContainsAny(sessionID, "\r\n") {
+		return ThreatMetrix{}, errors.New("nullgate: collector org_id and session_id must be nonempty strings without line breaks")
+	}
+	return ThreatMetrix{
+		Page:      page,
+		collector: &profilewire.Collector{URL: collectorURL, OrgID: orgID, SessionID: sessionID},
+	}, nil
+}
 
 // ThreatMetrixParams is used only by Session.Profile, not Solve. Inputs and
 // Actions use the same observations as SensorParams. Nil omits a collection;

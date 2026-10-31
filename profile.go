@@ -76,15 +76,22 @@ func (s *Session) Profile(ctx context.Context, params ThreatMetrixParams, target
 	if err != nil {
 		return nil, err
 	}
-	base, _ := url.Parse(website.URL)
-	reference, err := url.Parse(params.Protection.TagsURL)
-	if err != nil {
-		return nil, errors.New("nullgate: ThreatMetrix.TagsURL must be a tags.js URL with one nonempty org_id and session_id")
+	if (params.Protection.TagsURL == "") == (params.Protection.collector == nil) {
+		return nil, errors.New("nullgate: ThreatMetrix requires exactly one tags URL or direct collector")
 	}
-	tags := base.ResolveReference(reference)
-	tags.Fragment, tags.RawFragment = "", ""
-	if !isThreatMetrixTags(tags) {
-		return nil, errors.New("nullgate: ThreatMetrix.TagsURL must be a tags.js URL with one nonempty org_id and session_id")
+	var tagsURL string
+	if params.Protection.collector == nil {
+		base, _ := url.Parse(website.URL)
+		reference, err := url.Parse(params.Protection.TagsURL)
+		if err != nil {
+			return nil, errors.New("nullgate: ThreatMetrix.TagsURL must be a tags.js URL with one nonempty org_id and session_id")
+		}
+		tags := base.ResolveReference(reference)
+		tags.Fragment, tags.RawFragment = "", ""
+		if !isThreatMetrixTags(tags) {
+			return nil, errors.New("nullgate: ThreatMetrix.TagsURL must be a tags.js URL with one nonempty org_id and session_id")
+		}
+		tagsURL = tags.String()
 	}
 	var inputs *[]PreparedInput
 	if params.Inputs != nil {
@@ -99,7 +106,7 @@ func (s *Session) Profile(ctx context.Context, params ThreatMetrixParams, target
 		actions = &params.Actions
 	}
 	start, err := json.Marshal(profileStart{
-		Type: "start", Website: website, TagsURL: tags.String(), Timezone: s.timezone,
+		Type: "start", Website: website, TagsURL: tagsURL, Collector: params.Protection.collector, Timezone: s.timezone,
 		AtMS:   time.Now().UnixMilli(),
 		Inputs: inputs, Actions: actions,
 	})

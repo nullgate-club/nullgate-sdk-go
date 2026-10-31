@@ -55,6 +55,17 @@ func profileParams() nullgate.ThreatMetrixParams {
 	}}
 }
 
+const directCollectorURL = "https://arbitrary-profile.example:8443/fp/collector%2Fscript.js?opaque=a%2Fb&session_id=not-the-session&org_id=not-the-org&x=1&x=2&blank=&bare"
+
+func collectorProfileParams(t *testing.T) nullgate.ThreatMetrixParams {
+	t.Helper()
+	protection, err := nullgate.NewThreatMetrixCollector(page, directCollectorURL, "explicit-org", "source-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nullgate.ThreatMetrixParams{Protection: protection}
+}
+
 func profileTarget(t *testing.T, fetch nullgate.TargetFetch) nullgate.Target {
 	t.Helper()
 	target, err := nullgate.NewTarget(fetch, "")
@@ -287,7 +298,7 @@ func TestProfileRejectsMalformedAndDuplicateOperations(t *testing.T) {
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			profile, err := session.Profile(ctx, profileParams(), target)
+			profile, err := session.Profile(ctx, collectorProfileParams(t), target)
 			var failure *nullgate.ProtocolError
 			if profile != nil || !errors.As(err, &failure) || failure.RequestID != profileRequestID {
 				t.Fatalf("malformed source work did not fail with its source request ID: %v", err)

@@ -34,6 +34,20 @@ func run(ctx context.Context) error {
 	if pageURL == "" || key == "" {
 		return errors.New("set TARGET_URL and NULLGATE_API_KEY; TARGET_PROXY empty explicitly selects direct")
 	}
+	collectorURL, hasCollector := os.LookupEnv("TMX_COLLECTOR_URL")
+	orgID, hasOrg := os.LookupEnv("TMX_ORG_ID")
+	sessionID, hasSession := os.LookupEnv("TMX_SESSION_ID")
+	direct := hasCollector || hasOrg || hasSession
+	var protection nullgate.ThreatMetrix
+	if direct {
+		var err error
+		protection, err = nullgate.NewThreatMetrixCollector(
+			nullgate.Page{URL: pageURL}, collectorURL, orgID, sessionID,
+		)
+		if err != nil {
+			return err
+		}
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	defer transport.CloseIdleConnections()
@@ -102,16 +116,22 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return errors.New("target page response failed")
 	}
-	found, err := nullgate.FindProtections(nullgate.Page{URL: response.Request.URL.String(), HTML: string(body)})
-	if err != nil {
-		return err
-	}
-	if len(found) != 1 {
-		return errors.New("expected one ThreatMetrix tags script in the target page")
-	}
-	protection, ok := found[0].(nullgate.ThreatMetrix)
-	if !ok {
-		return errors.New("the discovered protection is not ThreatMetrix; use the target example for Akamai")
+	page := nullgate.Page{URL: response.Request.URL.String(), HTML: string(body)}
+	if direct {
+		protection.Page = page
+	} else {
+		found, err := nullgate.FindProtections(page)
+		if err != nil {
+			return err
+		}
+		if len(found) != 1 {
+			return errors.New("expected one ThreatMetrix tags script in the target page")
+		}
+		var ok bool
+		protection, ok = found[0].(nullgate.ThreatMetrix)
+		if !ok {
+			return errors.New("the discovered protection is not ThreatMetrix; use the target example for Akamai")
+		}
 	}
 	client, err := nullgate.NewClient(key, nullgate.Options{ProfileBaseURL: os.Getenv("NULLGATE_PROFILE_BASE_URL")})
 	if err != nil {

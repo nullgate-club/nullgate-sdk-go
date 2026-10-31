@@ -138,6 +138,40 @@ if err := profile.WaitCollected(ctx); err != nil {
 }
 ```
 
+For a caller-generated direct collector URL, use the validated constructor
+instead of discovery. It returns the same `ThreatMetrix` type accepted by
+`ThreatMetrixParams`:
+
+```go
+// Use the real site's document and explicit IDs from your application flow.
+protection, err := nullgate.NewThreatMetrixCollector(
+	nullgate.Page{URL: pageURL, HTML: pageHTML},
+	collectorURL, orgID, sessionID,
+)
+if err != nil {
+	return err
+}
+profile, err := session.Profile(ctx,
+	nullgate.ThreatMetrixParams{Protection: protection}, target)
+if err != nil {
+	return err
+}
+defer profile.Close()
+```
+
+The collector URL must be absolute HTTP(S), with a host and valid port, without
+userinfo, fragments, raw whitespace or backslashes. Its path and query are kept
+unchanged. Supply non-whitespace `orgID` and `sessionID` strings without line
+breaks; the SDK does not recover IDs from URL parameters, wrappers or source maps.
+Use exactly the same `sessionID` in the site's matching hidden form input. It is
+not the Nullgate continuation state ID, and profiling is not an acceptance guarantee.
+Keep `Page` as the real site's document, not the collector URL or `about:blank`.
+
+Direct collector and tags entries are mutually exclusive. Do not set `TagsURL`
+on a value returned by `NewThreatMetrixCollector`; missing or mixed entry sources
+fail before connecting or invoking the target callback. Discovered and manually
+supplied tags entries remain supported with their existing behavior.
+
 `ThreatMetrixParams` also accepts the existing `Inputs []Input` and
 `Actions []Action` observations. Inputs use the same local value hashing as
 `SensorParams`; input/change action values must be prepared `InputValue` summaries;
@@ -151,6 +185,11 @@ absent; a non-nil empty slice means present-empty. Return actual
 `TargetResponse{Status, Headers, Body}` bytes, including HTTP error statuses.
 Connection failures are errors, not invented HTTP successes. The SDK performs
 the strict base64 wire conversion and timestamps response completion itself.
+
+Direct entry fetches arrive with `Role: "collector"` through that same callback.
+Every successfully issued target HTTP command is billed, including resource loads
+and target report requests. HTTP result callbacks, WebSocket lifecycle controls
+and ICE/TURN are not billed separately.
 
 The callback retains your existing TLS provider, cookie jar and HTTP proxy.
 For `omit`, use the provider's per-request no-cookie facility: neither send nor
@@ -190,6 +229,16 @@ Run the profiling example with `TARGET_URL`, `NULLGATE_API_KEY`, optional
 `NULLGATE_PROFILE_BASE_URL` overrides the API for local verification:
 
 ```sh
+go run ./examples/profile
+```
+
+To select explicit collector mode, also supply all three values below. This
+skips tags discovery; incomplete or malformed collector inputs fail before the
+example fetches the target page:
+
+```sh
+TMX_COLLECTOR_URL='https://your-collector.example/caller-generated-path?opaque=value' \
+TMX_ORG_ID='site-org-id' TMX_SESSION_ID='site-session-id' \
 go run ./examples/profile
 ```
 
