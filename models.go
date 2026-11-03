@@ -182,8 +182,9 @@ func (PixelParams) params()            {}
 func (PixelParams) String() string     { return "nullgate.PixelParams{Script:<redacted>}" }
 func (p PixelParams) GoString() string { return p.String() }
 
-// Input contains field attributes and an optional raw value. Solve hashes the
-// value locally and never includes it in the API request.
+// Input contains field attributes, an optional CSS selector, and an optional raw
+// value. The selector is sent separately from attributes; the value is hashed
+// locally and never included in the API request.
 type Input map[string]string
 
 // Action is a source-supported sensor interaction, in the service's native JSON shape.

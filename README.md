@@ -91,6 +91,13 @@ protection kinds. Sensor inputs/actions are optional; nil preserves server
 defaults while non-nil empty slices explicitly send empty lists. Raw input values
 are summarized and hashed locally before transmission.
 
+Each flat `Input` map may include a reserved `selector` CSS selector alongside
+`id`, `name`, and `value`. It is sent as top-level `selector`, never an attribute;
+an absent or empty selector is omitted. A selector must match exactly one native
+`input` or `textarea`, and any supplied nonempty `id`/`name` must also match.
+Selector-only binding is supported; without a selector, existing id/name binding
+is unchanged.
+
 ## Send and report
 
 After `solution.Wait(ctx)`, send `solution.Method`, `solution.URL`,

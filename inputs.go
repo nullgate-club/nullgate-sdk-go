@@ -25,11 +25,12 @@ type InputValue struct {
 // PreparedInput retains attributes but never a raw field value.
 type PreparedInput struct {
 	Attributes map[string]string `json:"attributes"`
+	Selector   *string           `json:"selector,omitempty"`
 	Value      InputValue        `json:"value"`
 }
 
 // PrepareInputs hashes UTF-16LE bytes locally, preserving field order and all
-// attributes except value. It does not mutate its argument.
+// attributes except value and the top-level selector. It does not mutate its argument.
 func PrepareInputs(inputs []Input) []PreparedInput {
 	prepared := make([]PreparedInput, len(inputs))
 	for i, field := range inputs {
@@ -83,7 +84,7 @@ func PrepareInputs(inputs []Input) []PreparedInput {
 		}
 		attributes := make(map[string]string, len(field))
 		for key, value := range field {
-			if key != "value" {
+			if key != "value" && key != "selector" {
 				attributes[key] = value
 			}
 		}
@@ -95,6 +96,9 @@ func PrepareInputs(inputs []Input) []PreparedInput {
 				Hash31: &comparison.raw, TrimmedHash31: &comparison.trimmed,
 				TrimmedLength: &comparison.length,
 			},
+		}
+		if selector, present := field["selector"]; present {
+			prepared[i].Selector = &selector
 		}
 	}
 	return prepared
