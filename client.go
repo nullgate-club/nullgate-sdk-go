@@ -209,6 +209,7 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 	s.document = payload.Website
 	s.mu.Unlock()
 	request.Header.Set("Authorization", "Bearer "+s.client.apiKey)
+	request.Header.Set("X-Nullgate-Error-Format", "1")
 	request.Header.Set("User-Agent", s.userAgent)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-State-ID", stateID)
@@ -357,6 +358,10 @@ func remoteFailure(err error) bool {
 
 func responseError(response *http.Response, body []byte) *APIError {
 	var detail any
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	_ = json.Unmarshal(body, &envelope)
 	if err := json.Unmarshal(body, &detail); err != nil {
 		detail = string(body)
 	} else if object, ok := detail.(map[string]any); ok {
@@ -364,5 +369,5 @@ func responseError(response *http.Response, body []byte) *APIError {
 			detail = value
 		}
 	}
-	return &APIError{StatusCode: response.StatusCode, Detail: detail, RequestID: response.Header.Get("X-Request-ID")}
+	return &APIError{StatusCode: response.StatusCode, Detail: detail, RequestID: response.Header.Get("X-Request-ID"), ErrorInfo: parseErrorInfo(envelope.Error)}
 }

@@ -64,6 +64,7 @@ func (p *Profile) readMessages() error {
 			}
 			p.mu.Lock()
 			p.RequestID = message.RequestID
+			p.errorFormat = message.ErrorFormat == 1
 			p.mu.Unlock()
 			p.session.mu.Lock()
 			if !p.session.closed {
@@ -156,7 +157,13 @@ func (p *Profile) readMessages() error {
 			if err := json.Unmarshal(message.Detail, &detail); err != nil {
 				return p.protocolError("malformed service error detail")
 			}
-			return &APIError{StatusCode: message.Status, Detail: detail, RequestID: message.RequestID}
+			failure := &APIError{StatusCode: message.Status, Detail: detail, RequestID: message.RequestID, ErrorInfo: parseErrorInfo(message.Error)}
+			p.mu.Lock()
+			if info := failure.ErrorInfo; info != nil && info.Code == "CLIENT_TRANSPORT_ERROR" && info.Origin == "client" && info.CommandID != nil {
+				failure.cause = p.targetErrors[*info.CommandID]
+			}
+			p.mu.Unlock()
+			return failure
 		default:
 			return p.protocolError("unknown message kind")
 		}
@@ -171,7 +178,19 @@ func (p *Profile) serveHTTP(id int64, request TargetRequest) {
 		return
 	}
 	if err != nil || response.Status < 100 || response.Status > 999 {
-		_ = p.send(p.ctx, profilewire.HTTPError{Type: "http.error", ID: id, Detail: "Target request failed"})
+		message := profilewire.HTTPError{Type: "http.error", ID: id, Detail: "Target request failed"}
+		p.mu.Lock()
+		if err != nil {
+			if p.targetErrors == nil {
+				p.targetErrors = make(map[int64]error)
+			}
+			p.targetErrors[id] = err
+		}
+		if p.errorFormat {
+			message.Error = transportCause(err)
+		}
+		p.mu.Unlock()
+		_ = p.send(p.ctx, message)
 		return
 	}
 	if response.Headers == nil {

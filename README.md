@@ -29,6 +29,11 @@ and your target provider's cookie jar across navigation. For ThreatMetrix, a
 session may begin profiles for subsequent documents to retain server-side
 provider storage. Each active profile owns exactly one document and socket.
 
+`X-State-ID` is SDK-managed server continuation, not a document ID, browser UUID
+or target cookie. Do not copy live state across unrelated documents/workers.
+Close profiles and sessions before the reusable client; close your target
+transport separately, since SDK shutdown never owns its cookie jar.
+
 With a discovered `sensor`, its fetched `script` and the target's current
 `cookies`, a single generation is shown below. `target` is your `tls-client`
 client and `http` is `github.com/bogdanfinn/fhttp`.
@@ -280,6 +285,69 @@ from the target client before solving again. After navigation, open a new
 session; keep the identity and target cookie jar. For blocking SBSD, revisit the
 original page and check the intended content rather than treating POST 200 as
 clearance.
+
+## Error handling and sensor stop semantics
+
+HTTP and WebSocket service errors use `*nullgate.APIError`, with `StatusCode`,
+`Detail`, `RequestID` and optional typed `ErrorInfo` (`ErrorInfo`, `ErrorTarget`,
+`TransportCause`). Use `errors.As`, not message matching:
+
+```go
+func describeServiceError(err error) {
+	var apiErr *nullgate.APIError
+	if !errors.As(err, &apiErr) {
+		return
+	}
+	fmt.Println("request_id=", apiErr.RequestID, "status=", apiErr.StatusCode)
+	if info := apiErr.ErrorInfo; info != nil {
+		fmt.Println("code=", info.Code, "origin=", info.Origin, "stage=", info.Stage)
+		if info.Target != nil {
+			fmt.Println(info.Target.Role, info.Target.Method, info.Target.Host)
+		}
+		if info.Cause != nil {
+			fmt.Println("cause_kind=", info.Cause.Kind)
+		}
+	}
+}
+```
+
+Add standard-library imports `errors` and `fmt` alongside your existing
+`nullgate` import. Call this on errors returned from `Solve`, profile startup
+and active-profile operations; return/handle other errors separately.
+`CLIENT_TRANSPORT_ERROR` (`Origin: "client"`, `Stage: "target_http"`) means the
+ThreatMetrix SDK sent `http.error`: your target callback could not provide a
+valid response. Its compatibility `502` is **not HTTP 502 from the target** or
+proof of a Nullgate outage. `Unwrap()` retains the local target cause only when
+metadata identifies the matching failed command; legacy or unrelated errors do
+not inherit it. Inspect it privately, not by logging raw strings. Return real target
+responses, including `4xx`/`5xx`, unchanged. SDK → Nullgate connection failures
+and genuine service/upstream errors are different; never relabel every `502`.
+
+New SDKs request `X-Nullgate-Error-Format: 1`; enriched profiling `http.error`
+requires the service's confirmation. Old clients retain the unchanged legacy
+wire, while new SDKs accept old servers with nil `ErrorInfo`. Fall back to
+status/request ID; never infer this code from an untyped `502`. Unknown
+codes/causes are valid. Nullable `Retryable` is a hint, not a retry loop.
+Check page/source/params pairing for invalid or unsupported input; discovery
+does not prove support. Lost responses may follow completed billable work.
+
+For support, share SDK version, operation, UTC time, request ID, status, available
+code/origin/stage, safe target role/method/host and cause kind/type/code. Never
+post keys, cookies, state IDs, proxy credentials, HAR files, private URLs,
+HTML/scripts, field values/hashes, generated bodies, raw detail or exceptions.
+See [diagnostics](https://docs.nullgate.club/en/diagnostics).
+
+Four sends do not guarantee `_abck` threshold `0`. `IsEnough` tests only the
+ordinary-send stop gate; threshold `0` means stop, not acceptance or successful
+credentials. Count completed target sensor responses in the current cookie
+generation, not `Solve` calls; reset on a new nonnegative generation. An unknown
+limit is not success. For explicit manual send-count experiments, repeat
+`session.Solve(ctx, nullgate.SensorParams{Protection: sensor, Script: script, Cookies: cookies})`
+in the same document, call `solution.Wait(ctx)`, POST the exact result through
+your target client, read/close the response and refresh cookies before continuing.
+This application-owned loop is not a `send_count` option, hidden retry or change
+to the normal cookie gate. Extra sends are not promised to help. Generation,
+POST completion and target acceptance are separate; even `200` may be a block.
 
 ## Develop
 

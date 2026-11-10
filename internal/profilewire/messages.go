@@ -21,9 +21,10 @@ type Collector struct {
 }
 
 type Hello struct {
-	Type      string `json:"type"`
-	StateID   string `json:"state_id"`
-	RequestID string `json:"request_id"`
+	Type        string `json:"type"`
+	StateID     string `json:"state_id"`
+	RequestID   string `json:"request_id"`
+	ErrorFormat int    `json:"error_format,omitempty"`
 }
 
 type Notice struct {
@@ -42,6 +43,7 @@ type ServiceError struct {
 	Status    int             `json:"status"`
 	Detail    json.RawMessage `json:"detail"`
 	RequestID string          `json:"request_id"`
+	Error     json.RawMessage `json:"error,omitempty"`
 }
 
 type HTTPRequest struct {
@@ -76,6 +78,7 @@ type HTTPError struct {
 	Type   string `json:"type"`
 	ID     int64  `json:"id"`
 	Detail string `json:"detail"`
+	Error  any    `json:"error,omitempty"`
 }
 
 type ICE struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,22 +22,24 @@ import (
 type Profile struct {
 	RequestID string
 
-	session   *Session
-	target    Target
-	ctx       context.Context
-	cancel    context.CancelFunc
-	ready     chan struct{}
-	collected chan struct{}
-	done      chan struct{}
-	writeGate chan struct{}
-	pageGate  chan struct{}
-	workers   sync.WaitGroup
-	stopOnce  sync.Once
-	closeOnce sync.Once
-	mu        sync.Mutex
-	conn      *websocket.Conn
-	err       error
-	pageDone  chan struct{}
+	session      *Session
+	target       Target
+	ctx          context.Context
+	cancel       context.CancelFunc
+	ready        chan struct{}
+	collected    chan struct{}
+	done         chan struct{}
+	writeGate    chan struct{}
+	pageGate     chan struct{}
+	workers      sync.WaitGroup
+	stopOnce     sync.Once
+	closeOnce    sync.Once
+	mu           sync.Mutex
+	conn         *websocket.Conn
+	err          error
+	pageDone     chan struct{}
+	errorFormat  bool
+	targetErrors map[int64]error
 }
 
 func (*Profile) String() string     { return "nullgate.Profile{Document:<redacted>, State:<redacted>}" }
@@ -168,6 +171,7 @@ func (p *Profile) run(stateID string, start []byte) {
 		p.workers.Wait()
 		p.mu.Lock()
 		p.conn, p.target, p.pageDone = nil, Target{}, nil
+		p.targetErrors = nil
 		p.mu.Unlock()
 		p.session.client.profilesMu.Lock()
 		delete(p.session.client.profiles, p)
@@ -200,6 +204,7 @@ func (p *Profile) run(stateID string, start []byte) {
 	headers.Set("Authorization", "Bearer "+client.apiKey)
 	headers.Set("User-Agent", p.session.userAgent)
 	headers.Set("X-State-ID", stateID)
+	headers.Set("X-Nullgate-Error-Format", "1")
 	conn, response, err := dialer.DialContext(p.ctx, endpoint, headers)
 	if err != nil {
 		if p.ctx.Err() != nil {
@@ -209,7 +214,14 @@ func (p *Profile) run(stateID string, start []byte) {
 			if _, err := uuid.Parse(requestID); err != nil {
 				requestID = ""
 			}
-			p.stop(&APIError{StatusCode: response.StatusCode, RequestID: requestID})
+			var body []byte
+			if response.Body != nil {
+				body, _ = io.ReadAll(response.Body)
+				response.Body.Close()
+			}
+			failure := responseError(response, body)
+			failure.RequestID = requestID
+			p.stop(failure)
 		} else {
 			p.stop(&TransportError{Operation: "profile", Err: err})
 		}

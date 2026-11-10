@@ -25,12 +25,18 @@ type APIError struct {
 	StatusCode int
 	Detail     any
 	RequestID  string
+	ErrorInfo  *ErrorInfo
+	cause      error
 }
 
 func (e *APIError) Error() string {
+	if e.ErrorInfo != nil {
+		return fmt.Sprintf("nullgate: %s origin=%s (status=%d request_id=%s)", safeErrorCode(e.ErrorInfo.Code), safeErrorOrigin(e.ErrorInfo.Origin), e.StatusCode, e.RequestID)
+	}
 	return fmt.Sprintf("nullgate: HTTP %d (request_id=%s)", e.StatusCode, e.RequestID)
 }
 func (e *APIError) GoString() string { return e.Error() }
+func (e *APIError) Unwrap() error    { return e.cause }
 
 // ProtocolError means a successful API response was missing required data or
 // had an invalid shape. Problem never includes response bodies or source text.
