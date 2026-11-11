@@ -22,6 +22,7 @@ import (
 const (
 	DefaultBaseURL        = "https://akamai.nullgate.club"
 	DefaultProfileBaseURL = "https://threatmetrix.nullgate.club"
+	DefaultAmazonBaseURL  = "https://amazon.nullgate.club"
 	DefaultAnalyticsURL   = "https://analytics.nullgate.club"
 	reportTimeout         = 3 * time.Second
 )
@@ -32,6 +33,7 @@ const (
 type Options struct {
 	BaseURL        string
 	ProfileBaseURL string
+	AmazonBaseURL  string
 	AnalyticsURL   string
 	HTTPClient     *http.Client
 }
@@ -42,10 +44,12 @@ type Client struct {
 	apiKey         string
 	baseURL        string
 	profileBaseURL string
+	amazonBaseURL  string
 	analyticsURL   string
 	http           *http.Client
 	ownsTransport  bool
 	closed         atomic.Bool
+	done           chan struct{}
 	profilesMu     sync.Mutex
 	profiles       map[*Profile]struct{}
 }
@@ -66,6 +70,13 @@ func NewClient(apiKey string, options Options) (*Client, error) {
 	}
 	if options.ProfileBaseURL == "" {
 		options.ProfileBaseURL = DefaultProfileBaseURL
+	}
+	if options.AmazonBaseURL == "" {
+		options.AmazonBaseURL = DefaultAmazonBaseURL
+	}
+	amazonBase, err := apiBase(options.AmazonBaseURL)
+	if err != nil {
+		return nil, errors.New("nullgate: AmazonBaseURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
 	}
 	base, err := apiBase(options.BaseURL)
 	if err != nil {
@@ -93,8 +104,8 @@ func NewClient(apiKey string, options Options) (*Client, error) {
 	api.Jar = nil
 	api.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
-		apiKey: apiKey, baseURL: base, profileBaseURL: profileBase, analyticsURL: analytics,
-		http: &api, ownsTransport: ownsTransport,
+		apiKey: apiKey, baseURL: base, profileBaseURL: profileBase, amazonBaseURL: amazonBase, analyticsURL: analytics,
+		http: &api, ownsTransport: ownsTransport, done: make(chan struct{}),
 	}, nil
 }
 
@@ -114,20 +125,24 @@ type SessionOptions struct {
 	Timezone  *string
 }
 
-// Session serializes generation while permitting independent sessions to share
-// the client's connection pool. Its mutex protects state and its context-aware
-// gate lets callers cancel while another generation is in flight.
+// Session serializes Akamai/ThreatMetrix generation and Amazon generation in
+// independent continuation streams. Each context-aware gate permits cancellation
+// while another generation in that stream is in flight.
 type Session struct {
-	client    *Client
-	identity  string
-	userAgent string
-	timezone  *string
-	gate      chan struct{}
-	mu        sync.Mutex
-	stateID   string
-	document  websitePayload
-	closed    bool
-	profiles  map[*Profile]struct{}
+	client         *Client
+	identity       string
+	userAgent      string
+	timezone       *string
+	gate           chan struct{}
+	amazonGate     chan struct{}
+	mu             sync.Mutex
+	stateID        string
+	document       websitePayload
+	amazonStateID  string
+	amazonDocument websitePayload
+	closed         bool
+	done           chan struct{}
+	profiles       map[*Profile]struct{}
 }
 
 func (s *Session) String() string   { return "nullgate.Session{State:<redacted>}" }
@@ -154,9 +169,14 @@ func (c *Client) Open(options SessionOptions) (*Session, error) {
 	if err != nil {
 		return nil, errors.New("nullgate: could not create session state")
 	}
+	amazonState, err := uuid.NewRandom()
+	if err != nil {
+		return nil, errors.New("nullgate: could not create Amazon session state")
+	}
 	return &Session{
 		client: c, identity: identity.String(), userAgent: options.UserAgent,
 		timezone: timezone, gate: make(chan struct{}, 1), stateID: state.String(),
+		amazonStateID: amazonState.String(), amazonGate: make(chan struct{}, 1), done: make(chan struct{}),
 	}, nil
 }
 
@@ -174,6 +194,10 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 		defer func() { <-s.gate }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-s.done:
+		return nil, ErrClosed
+	case <-s.client.done:
+		return nil, ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -213,8 +237,11 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 	request.Header.Set("User-Agent", s.userAgent)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-State-ID", stateID)
-	response, err := s.client.http.Do(request)
+	response, err := s.generationRequest(request, body)
 	if err != nil {
+		if errors.Is(err, ErrClosed) {
+			return nil, ErrClosed
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -250,7 +277,11 @@ func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
 // not close the client or change cancellation of in-flight Solve requests.
 func (s *Session) Close() error {
 	s.mu.Lock()
+	if !s.closed {
+		close(s.done)
+	}
 	s.closed, s.stateID, s.document = true, "", websitePayload{}
+	s.amazonStateID, s.amazonDocument = "", websitePayload{}
 	profiles := make([]*Profile, 0, len(s.profiles))
 	for profile := range s.profiles {
 		profiles = append(profiles, profile)
@@ -270,6 +301,9 @@ func (s *Session) Close() error {
 func (c *Client) Close() error {
 	c.profilesMu.Lock()
 	alreadyClosed := c.closed.Swap(true)
+	if !alreadyClosed {
+		close(c.done)
+	}
 	profiles := make([]*Profile, 0, len(c.profiles))
 	for profile := range c.profiles {
 		profiles = append(profiles, profile)

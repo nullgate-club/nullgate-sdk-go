@@ -1,13 +1,13 @@
 # Nullgate Go SDK
 
-Typed clients for Nullgate's Akamai Pixel, Sensor and SBSD APIs and active
-ThreatMetrix profiling, with local protection discovery and isolated documents.
+Typed clients for Nullgate's Akamai Pixel, Sensor and SBSD APIs, Amazon FWCIM,
+and active ThreatMetrix profiling, with local discovery and isolated documents.
 The SDK's `net/http` client talks to Nullgate, not to your target website.
 
-Default endpoints are `https://akamai.nullgate.club` for generation,
-`https://threatmetrix.nullgate.club` for profiling and
-`https://analytics.nullgate.club` for optional diagnostic reports. `Options`
-exposes `BaseURL`, `ProfileBaseURL` and `AnalyticsURL` overrides.
+Default endpoints are `https://akamai.nullgate.club` for Akamai generation,
+`https://amazon.nullgate.club` for FWCIM, `https://threatmetrix.nullgate.club`
+for profiling and `https://analytics.nullgate.club` for optional reports.
+`Options` exposes `BaseURL`, `AmazonBaseURL`, `ProfileBaseURL` and `AnalyticsURL`.
 
 ## Install from GitHub
 
@@ -102,6 +102,89 @@ an absent or empty selector is omitted. A selector must match exactly one native
 `input` or `textarea`, and any supplied nonempty `id`/`name` must also match.
 Selector-only binding is supported; without a selector, existing id/name binding
 is unchanged.
+
+## Amazon FWCIM
+
+Call `session.Fwcim` directly with the caller's `Page`; no `Protection`, script
+source, discovery or JavaScript execution is involved. Amazon continuation state
+is separate from Akamai/ThreatMetrix state in the same session. Reuse the
+session across Amazon navigations to retain provider storage; use a new page
+observation for each navigation.
+
+```go
+// page contains the caller-fetched URL/HTML. timing contains actual observed
+// navigation timestamps in Unix milliseconds, not fabricated browser timings.
+// If page.StartedAtMS is supplied, timing["navigationStart"] must equal it.
+solution, err := session.Fwcim(ctx, nullgate.FwcimParams{
+	Page: page, PerformanceTiming: timing, Cookies: cookies,
+	FormSelector: "#signin",
+	Inputs: []nullgate.FwcimInput{
+		{ID: "ap_email", Value: email}, // summarized locally, never sent raw
+	},
+})
+if err != nil {
+	return err
+}
+if err := solution.Wait(ctx); err != nil {
+	return err
+}
+form.Set("metadata1", solution.Metadata1)
+encodedBody := form.Encode() // encode the complete form ONCE
+// Send encodedBody through your own target HTTP client, applying
+// solution.Headers. Your client owns cookies and any password encryption.
+```
+
+`FwcimSolution.Metadata1` is sensitive and hidden from formatted debug output.
+`SendAt` is the earliest target submission time in Unix seconds; `Wait(ctx)`
+honors it and cancellation. `RequestID` is the actual response `X-Request-ID`.
+Conflicting target header values under case-equivalent names produce a protocol error.
+The SDK never logs in, sends credentials, or submits the form for you.
+
+`PerformanceTiming` is required. Set `Page.DocumentID` and `Page.StartedAtMS`
+together to preserve an existing observed document identity. Literal pages
+without those fields use the caller's observed `navigationStart` as their start
+and retain identity for unchanged URL/HTML in the session. Do not change the
+start on a repeated call for that document. No geometry or timing is invented.
+`Referrer` and optional positive `HistoryLength` describe the caller's navigation.
+`Submitted` defaults to true; pass a pointer to false for an unsubmitted form.
+Nil `Inputs`/`Actions` omit observations; non-nil empty slices send `[]`.
+
+Each `FwcimInput` accepts only `ID`, `Name`, an optional disambiguating CSS
+`Selector`, and a raw nonpassword `Value`. The selected native input/textarea
+must match supplied ID/name. Values become the existing redacted UTF-16 summary
+plus a separate standard CRC32 checksum over CESU-8 bytes (UTF-16 units encoded
+individually as UTF-8); the checksum is not placed inside the value summary.
+Optional `Geometry` carries observed left/top/width/height only. Optional `Text`
+explicitly sends nonpassword canvas text; omit it unless intended.
+Password observations and HTML containing nonempty password values fail locally.
+The SDK recognizes normalized password types, `current-password`/`new-password`
+autocomplete tokens, and canonical `password`/`ap_password` IDs or names.
+An explicit `FormSelector` must select exactly one form. Observations must be
+descendants of that form, regardless of their `form` attribute.
+The HTML password-value guard always covers the entire document.
+It also checks nonempty duplicate `value` attributes that ordinary DOM lookup ignores.
+Form/input selection excludes inert template content, but the password guard still checks it.
+`navigationStart` must be positive. Other timestamps may be zero for unknown
+values, but nonzero timestamps must not precede `navigationStart`.
+Amazon actions accept finite numeric observations, touch points with non-null
+`x`/`y` and an optional integer `identifier`, and null or three-element motion
+vectors whose elements may be null. `checksum` is a uint32 or null, and `text`
+is an explicitly supplied nonpassword string or null. Raw `value` and `key`
+fields are rejected. `input_summary` is `[nonnegative length, null or four
+nonnegative counts]`, not an `InputValue` object.
+The SDK captures custom JSON serialization once, validates that actual JSON,
+and sends detached values rather than invoking caller hooks again.
+Amazon generation has its own queue and continuation state, independent of
+Akamai/ThreatMetrix generation.
+
+For deployment admission pauses, generation and the initial ThreatMetrix
+WebSocket handshake retry at most twice only on HTTP 503 with
+one `X-Nullgate-Maintenance: 1` value and one finite numeric `Retry-After` value
+between 0 and 5 seconds. Response bodies do not classify maintenance.
+Cancellation and closing the client or session stop maintenance waits without changing caller
+ownership of active generation HTTP requests. Maintenance rejections do not rotate
+generation continuation state. Unmarked 503/502, transport failures, active sockets
+and target HTTP are never retried by this policy.
 
 ## Send and report
 

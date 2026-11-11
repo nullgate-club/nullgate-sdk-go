@@ -64,6 +64,10 @@ func (s *Session) Profile(ctx context.Context, params ThreatMetrixParams, target
 		defer func() { <-s.gate }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-s.done:
+		return nil, ErrClosed
+	case <-s.client.done:
+		return nil, ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -205,7 +209,31 @@ func (p *Profile) run(stateID string, start []byte) {
 	headers.Set("User-Agent", p.session.userAgent)
 	headers.Set("X-State-ID", stateID)
 	headers.Set("X-Nullgate-Error-Format", "1")
-	conn, response, err := dialer.DialContext(p.ctx, endpoint, headers)
+	var conn *websocket.Conn
+	var response *http.Response
+	var err error
+	for attempt := 0; ; attempt++ {
+		p.session.mu.Lock()
+		closed := p.session.closed
+		p.session.mu.Unlock()
+		if closed || client.closed.Load() {
+			p.stop(ErrClosed)
+			return
+		}
+		conn, response, err = dialer.DialContext(p.ctx, endpoint, headers)
+		if err == nil {
+			break
+		}
+		delay, retry := maintenanceDelay(response)
+		if !retry || attempt == 2 {
+			break
+		}
+		response.Body.Close()
+		if waitErr := p.session.waitMaintenance(p.ctx, delay); waitErr != nil {
+			p.stop(waitErr)
+			return
+		}
+	}
 	if err != nil {
 		if p.ctx.Err() != nil {
 			p.stop(p.ctx.Err())

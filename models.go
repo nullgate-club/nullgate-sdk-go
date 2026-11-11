@@ -1,5 +1,6 @@
 // Package nullgate discovers supported protections locally, prepares Akamai
-// target POSTs, and runs active ThreatMetrix profiles. Target HTTP stays caller-owned.
+// target POSTs and Amazon FWCIM metadata, and runs active ThreatMetrix profiles.
+// Target HTTP stays caller-owned.
 package nullgate
 
 import (
