@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -31,12 +33,14 @@ func (c *Client) OpenWebSocket(ctx context.Context, path string) (*websocket.Con
 		}
 		data, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		response.Body.Close()
-		failure.Status = response.StatusCode
 		if readErr != nil {
-			return nil, failure
+			return nil, &Error{Code: "protocol_error", Message: "Profile handshake rejected", Status: response.StatusCode}
 		}
 		serviceError := decodeError(data, response.StatusCode)
-		delay, retry := retryAfter(response.Header.Get("Retry-After"))
+		if serviceError.Code == "" || serviceError.Message == "" || serviceError.RequestID == "" {
+			serviceError = &Error{Code: "protocol_error", Message: "Profile handshake rejected", Status: response.StatusCode}
+		}
+		delay, retry := websocketRetryDelay(response.Header.Get("Retry-After"))
 		if serviceError.Code == "maintenance" && retry && attempt < 2 {
 			if err := sleep(ctx, delay); err != nil {
 				return nil, transportError(ctx, err)
@@ -45,4 +49,21 @@ func (c *Client) OpenWebSocket(ctx context.Context, path string) (*websocket.Con
 		}
 		return nil, serviceError
 	}
+}
+
+func websocketRetryDelay(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds >= 0 && seconds <= 86400 {
+		return time.Duration(seconds * float64(time.Second)), true
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		delay := time.Until(at)
+		if delay < 0 {
+			delay = 0
+		}
+		return delay, true
+	}
+	return 0, false
 }

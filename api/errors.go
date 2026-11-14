@@ -19,7 +19,14 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("nullgate: %s (status=%d request_id=%s)", e.Code, e.Status, e.RequestID)
+	message := "nullgate: " + e.Code + ": " + e.Message
+	if e.Status != 0 {
+		message += fmt.Sprintf(" (status=%d)", e.Status)
+	}
+	if e.RequestID != "" {
+		message += " request_id=" + e.RequestID
+	}
+	return message
 }
 func (e *Error) GoString() string          { return e.Error() }
 func (e *Error) Unwrap() error             { return e.Cause }
