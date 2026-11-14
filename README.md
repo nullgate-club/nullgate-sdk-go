@@ -27,7 +27,7 @@ The SDK calls the Nullgate API and prepares requests for target sites. You own t
 Get an API key from [@nullgate_app](https://t.me/nullgate_app). Install the SDK into your Go module:
 
 ```sh
-go get github.com/nullgate-club/nullgate-sdk-go/v2@main
+GOPROXY=direct go get github.com/nullgate-club/nullgate-sdk-go/v2@main
 export NULLGATE_API_KEY='ng_your_key'
 ```
 
