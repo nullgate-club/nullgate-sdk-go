@@ -14,9 +14,11 @@ import (
 	"time"
 
 	nullgate "github.com/nullgate-club/nullgate-sdk-go/v2"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/amazon/acic"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/api"
 )
 
-func send(ctx context.Context, client *http.Client, req *nullgate.AcicRequest) (*http.Response, []byte, error) {
+func send(ctx context.Context, client *http.Client, req *acic.Request) (*http.Response, []byte, error) {
 	r, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
 		return nil, nil, err
@@ -44,11 +46,11 @@ func send(ctx context.Context, client *http.Client, req *nullgate.AcicRequest) (
 	return resp, body, nil
 }
 func solve(ctx context.Context, ng *nullgate.Client, amazon, aws *http.Client, entryURL string) (int, error) {
-	entry, body, err := send(ctx, amazon, &nullgate.AcicRequest{Method: "GET", URL: entryURL})
+	entry, body, err := send(ctx, amazon, &acic.Request{Method: "GET", URL: entryURL})
 	if err != nil {
 		return 0, err
 	}
-	setup, err := nullgate.DiscoverAcic(entry.Request.URL.String(), string(body))
+	setup, err := acic.Discover(entry.Request.URL.String(), string(body))
 	if err != nil {
 		return 0, err
 	}
@@ -65,7 +67,7 @@ func solve(ctx context.Context, ng *nullgate.Client, amazon, aws *http.Client, e
 		if err != nil {
 			return 0, err
 		}
-		state, err := nullgate.ParseAcicResult(resp.Header)
+		state, err := acic.ParseResult(resp.Header)
 		if err != nil {
 			return 0, err
 		}
@@ -90,7 +92,7 @@ func solve(ctx context.Context, ng *nullgate.Client, amazon, aws *http.Client, e
 		var answer string
 		switch state.ActionType {
 		case "PROOF_OF_WORK_LEVEL_3", "PROOF_OF_WORK_LEVEL_3_CHAIN_WAF_ADVERSARIAL_SYNTHETIC_GRID_V2_LEVEL_2":
-			proof, e := ng.AcicPow(ctx, nullgate.AcicPowOptions{ChallengeType: state.ActionType, HTML: string(html)})
+			proof, e := ng.Amazon.ACIC.Pow(ctx, acic.PowOptions{ChallengeType: state.ActionType, HTML: string(html)})
 			if e != nil {
 				return 0, e
 			}
@@ -99,7 +101,7 @@ func solve(ctx context.Context, ng *nullgate.Client, amazon, aws *http.Client, e
 			}
 			answer = proof.Response
 		case "WAF_ADVERSARIAL_SYNTHETIC_GRID_V2_LEVEL_2", "WAF_ADVERSARIAL_SYNTHETIC_GRID_V2_LEVEL_3":
-			waf, e := nullgate.DiscoverAcicWaf(resp.Request.URL.String(), string(html))
+			waf, e := acic.DiscoverWaf(resp.Request.URL.String(), string(html))
 			if e != nil {
 				return 0, e
 			}
@@ -112,7 +114,7 @@ func solve(ctx context.Context, ng *nullgate.Client, amazon, aws *http.Client, e
 			}
 			presented := time.Now()
 			for range waf.RoundsRequired {
-				solution, e := ng.AcicWaf(ctx, nullgate.AcicWafOptions{Problem: problem})
+				solution, e := ng.Amazon.ACIC.Waf(ctx, acic.WafOptions{Problem: problem})
 				if e != nil {
 					return 0, e
 				}
@@ -155,7 +157,7 @@ func main() {
 	if len(os.Args) != 2 {
 		log.Fatal("usage: acic <fresh entry URL>")
 	}
-	ng, err := nullgate.NewClient("", nullgate.Options{})
+	ng, err := nullgate.New("", api.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}

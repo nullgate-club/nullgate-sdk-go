@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/nullgate-club/nullgate-sdk-go/v2"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/api"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/classifier"
 )
 
 func run() error {
@@ -18,7 +20,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	client, err := nullgate.NewClient("", nullgate.Options{})
+	client, err := nullgate.New("", api.Options{})
 	if err != nil {
 		return err
 	}
@@ -26,14 +28,14 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if os.Args[1] == "classify" {
-		result, err := client.Classify(ctx, nullgate.ClassifyOptions{Images: [][]byte{image}, Labels: os.Args[3:], Model: nullgate.Balanced})
+		result, err := client.Classifier.Classify(ctx, classifier.ClassifyOptions{Images: [][]byte{image}, Labels: os.Args[3:], Model: classifier.Balanced})
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Best label: %s\n", result.Results[0].Label)
 		return nil
 	}
-	result, err := client.Match(ctx, nullgate.MatchOptions{Images: [][]byte{image}, Queries: os.Args[3:]})
+	result, err := client.Classifier.Match(ctx, classifier.MatchOptions{Images: [][]byte{image}, Queries: os.Args[3:]})
 	if err != nil {
 		return err
 	}

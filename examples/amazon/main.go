@@ -14,6 +14,9 @@ import (
 
 	"github.com/andybalholm/cascadia"
 	"github.com/nullgate-club/nullgate-sdk-go/v2"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/amazon"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/api"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/browser"
 	"golang.org/x/net/html"
 )
 
@@ -46,7 +49,7 @@ func run() error {
 		return err
 	}
 	httpClient := &http.Client{Jar: jar}
-	client, err := nullgate.NewClient("", nullgate.Options{})
+	client, err := nullgate.New("", api.Options{})
 	if err != nil {
 		return err
 	}
@@ -97,15 +100,15 @@ func run() error {
 		}
 	}
 	values.Set("ap_email", email)
-	session, err := client.Session(nullgate.SessionOptions{UserAgent: ua})
+	session, err := browser.New(browser.Options{UserAgent: ua})
 	if err != nil {
 		return err
 	}
-	page, err := session.Page(pageURL.String(), string(body), nullgate.PageOptions{StartedAtMS: &start})
+	page, err := session.Page(pageURL.String(), string(body), browser.PageOptions{StartedAtMS: &start})
 	if err != nil {
 		return err
 	}
-	inputs, err := page.FwcimInputs([]nullgate.Input{{"name": "ap_email", "value": email}})
+	inputs, err := amazon.PrepareInputs(page, []browser.Input{{"name": "ap_email", "value": email}})
 	if err != nil {
 		return err
 	}
@@ -113,7 +116,11 @@ func run() error {
 	for _, cookie := range jar.Cookies(pageURL) {
 		cookies[cookie.Name] = cookie.Value
 	}
-	result, err := page.Fwcim(ctx, nullgate.FwcimOptions{Form: selector, Timing: map[string]float64{"navigationStart": float64(start), "fetchStart": float64(start), "responseEnd": float64(end)}, Inputs: inputs, Cookies: cookies})
+	product, err := client.Amazon.Session(session)
+	if err != nil {
+		return err
+	}
+	result, err := product.Fwcim(ctx, page, amazon.FwcimOptions{Form: selector, Timing: map[string]float64{"navigationStart": float64(start), "fetchStart": float64(start), "responseEnd": float64(end)}, Inputs: inputs, Cookies: cookies})
 	if err != nil {
 		return err
 	}

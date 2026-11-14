@@ -10,7 +10,9 @@ import (
 	"net/http/cookiejar"
 	"os"
 
-	nullgate "github.com/nullgate-club/nullgate-sdk-go/v2"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/api"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/browser"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/threatmetrix"
 )
 
 func main() {
@@ -21,10 +23,10 @@ func main() {
 	}
 	withCookies := &http.Client{Jar: jar}
 	withoutCookies := &http.Client{}
-	send := func(ctx context.Context, request nullgate.TargetRequest) (nullgate.TargetResponse, error) {
+	send := func(ctx context.Context, request threatmetrix.TargetRequest) (threatmetrix.TargetResponse, error) {
 		req, err := http.NewRequestWithContext(ctx, request.Method, request.URL, nil)
 		if err != nil {
-			return nullgate.TargetResponse{}, err
+			return threatmetrix.TargetResponse{}, err
 		}
 		if request.Body != nil {
 			req.Body = io.NopCloser(bytes.NewReader(request.Body))
@@ -34,17 +36,17 @@ func main() {
 			req.Header.Set(name, value)
 		}
 		client := withCookies
-		if request.Credentials == nullgate.CredentialsOmit {
+		if request.Credentials == threatmetrix.CredentialsOmit {
 			client = withoutCookies
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return nullgate.TargetResponse{}, err
+			return threatmetrix.TargetResponse{}, err
 		}
 		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return nullgate.TargetResponse{}, err
+			return threatmetrix.TargetResponse{}, err
 		}
 		headers := make(map[string]string)
 		for name, values := range resp.Header {
@@ -52,14 +54,14 @@ func main() {
 				headers[name] = values[0]
 			}
 		}
-		return nullgate.TargetResponse{Status: resp.StatusCode, Headers: headers, Body: body}, nil
+		return threatmetrix.TargetResponse{Status: resp.StatusCode, Headers: headers, Body: body}, nil
 	}
-	client, err := nullgate.NewClient("", nullgate.Options{})
+	client, err := api.New("", api.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer client.Close()
-	session, err := client.Session(nullgate.SessionOptions{UserAgent: os.Getenv("USER_AGENT")})
+	session, err := browser.New(browser.Options{UserAgent: os.Getenv("USER_AGENT")})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,11 +69,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	page, err := session.Page(os.Getenv("PAGE_URL"), string(html), nullgate.PageOptions{})
+	page, err := session.Page(os.Getenv("PAGE_URL"), string(html), browser.PageOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
-	profile, err := page.ThreatMetrix(ctx, nullgate.ThreatMetrixOptions{Send: send, ScriptURL: os.Getenv("TAGS_URL")})
+	productSession, err := threatmetrix.New(client).Session(session)
+	if err != nil {
+		log.Fatal(err)
+	}
+	profile, err := productSession.Start(ctx, page, threatmetrix.Options{Send: send, ScriptURL: os.Getenv("TAGS_URL")})
 	if err != nil {
 		log.Fatal(err)
 	}

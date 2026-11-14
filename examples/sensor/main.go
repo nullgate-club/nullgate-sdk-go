@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/nullgate-club/nullgate-sdk-go/v2"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/akamai"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/api"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/browser"
 )
 
 func fetch(ctx context.Context, client *http.Client, address, ua string) (string, string, error) {
@@ -33,7 +36,7 @@ func fetch(ctx context.Context, client *http.Client, address, ua string) (string
 	return string(body), resp.Request.URL.String(), err
 }
 
-func send(ctx context.Context, client *http.Client, generated *nullgate.Request) error {
+func send(ctx context.Context, client *http.Client, generated *akamai.Request) error {
 	if err := generated.Wait(ctx); err != nil {
 		return err
 	}
@@ -68,7 +71,7 @@ func run() error {
 		return err
 	}
 	httpClient := &http.Client{Jar: jar}
-	client, err := nullgate.NewClient("", nullgate.Options{})
+	client, err := nullgate.New("", api.Options{})
 	if err != nil {
 		return err
 	}
@@ -77,17 +80,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	session, err := client.Session(nullgate.SessionOptions{UserAgent: ua})
+	session, err := browser.New(browser.Options{UserAgent: ua})
 	if err != nil {
 		return err
 	}
-	page, err := session.Page(pageURL, html, nullgate.PageOptions{})
+	product, err := client.Akamai.Session(session)
+	if err != nil {
+		return err
+	}
+	page, err := session.Page(pageURL, html, browser.PageOptions{})
 	if err != nil {
 		return err
 	}
 	scriptURL := os.Getenv("TARGET_SCRIPT_URL")
 	if scriptURL == "" {
-		scriptURL, err = page.SensorURL()
+		scriptURL, err = akamai.SensorURL(page)
 		if err != nil {
 			return err
 		}
@@ -108,7 +115,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	pixelURL, err := page.PixelURL()
+	pixelURL, err := akamai.PixelURL(page)
 	if err != nil {
 		return err
 	}
@@ -121,7 +128,7 @@ func run() error {
 		for _, cookie := range jar.Cookies(u) {
 			cookies[cookie.Name] = cookie.Value
 		}
-		request, err := page.Sensor(ctx, nullgate.SensorOptions{Script: script, ScriptURL: scriptURL, Cookies: cookies})
+		request, err := product.Sensor(ctx, page, akamai.SensorOptions{Script: script, ScriptURL: scriptURL, Cookies: cookies})
 		if err != nil {
 			return err
 		}
@@ -134,7 +141,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			pixel, err := page.Pixel(ctx, nullgate.PixelOptions{Script: pixelScript, ScriptURL: pixelURL})
+			pixel, err := product.Pixel(ctx, page, akamai.PixelOptions{Script: pixelScript, ScriptURL: pixelURL})
 			if err != nil {
 				return err
 			}

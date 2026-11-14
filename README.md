@@ -16,11 +16,11 @@ The SDK calls the Nullgate API and prepares requests for target sites. You own t
 
 | Product | Methods | Guide |
 |---|---|---|
-| Akamai | `Page.Sensor`, `Page.Pixel`, `Page.Sbsd` | [Akamai](https://nullgate.club/en/akamai) |
-| Amazon FWCIM | `Page.Fwcim` returns `metadata1` for the original form | [Amazon](https://nullgate.club/en/amazon) |
-| Amazon ACIC | `Client.AcicPow`, `Client.AcicWaf` | [ACIC](https://nullgate.club/en/amazon-acic) |
-| ThreatMetrix | `Page.ThreatMetrix` starts a profiling session | [ThreatMetrix](https://nullgate.club/en/threatmetrix) |
-| Classifier | `Client.Classify` chooses a label, `Client.Match` scores independent queries | [Classifier](https://nullgate.club/en/classifier) |
+| Akamai | `akamai.Session.Sensor`, `Pixel`, `Sbsd` | [Akamai](https://nullgate.club/en/akamai) |
+| Amazon FWCIM | `amazon.Session.Fwcim` returns `metadata1` for the original form | [Amazon](https://nullgate.club/en/amazon) |
+| Amazon ACIC | `client.Amazon.ACIC.Pow`, `Waf` | [ACIC](https://nullgate.club/en/amazon-acic) |
+| ThreatMetrix | `threatmetrix.Session.Start` starts a profiling session | [ThreatMetrix](https://nullgate.club/en/threatmetrix) |
+| Classifier | `client.Classifier.Classify`, `Match` | [Classifier](https://nullgate.club/en/classifier) |
 
 ## Quick start
 
@@ -43,27 +43,87 @@ import (
     "time"
 
     "github.com/nullgate-club/nullgate-sdk-go/v2"
+    "github.com/nullgate-club/nullgate-sdk-go/v2/api"
 )
 
 func main() {
-    client, err := nullgate.NewClient("", nullgate.Options{})
+    client, err := nullgate.New("", api.Options{})
     if err != nil { log.Fatal(err) }
     defer client.Close()
     ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
     defer cancel()
-    account, err := client.Account(ctx)
+    account, err := client.Accounts.Get(ctx)
     if err != nil { log.Fatal(err) }
     fmt.Printf("Balance: %s %s\n", account.Balance, account.Currency)
 }
 ```
 
-An empty key makes `NewClient` read `NULLGATE_API_KEY`. Pass a context to every SDK network operation and wait. Close the client when finished. `Client.Usage(ctx, nullgate.UsageOptions{})` retrieves usage buckets. Monetary values are decimal strings, not floating-point amounts. See [billing and prices](https://nullgate.club/en/billing).
+An empty key makes `nullgate.New` read `NULLGATE_API_KEY`. Pass a context to every SDK network operation and wait. Close the client when finished. `client.Accounts.Usage(ctx, accounts.UsageOptions{})` retrieves usage buckets from the `accounts` package. Monetary values are decimal strings, not floating-point amounts. See [billing and prices](https://nullgate.club/en/billing).
+
+The root client assembles all products. For a single product, you can instead create a shared connection with `api.New` and pass it to `classifier.New`. Close the connection when finished.
 
 ## Examples
 
 Run these commands from the SDK checkout. Use an authorized target and your actual user agent.
 
 ### Akamai sensor and pixel
+This complete example reads previously fetched page and sensor script files, then sends one sensor request. Set `TARGET_URL`, `TARGET_SCRIPT_URL`, and `TARGET_USER_AGENT` to the observed values. In a real visit, fetch both files and send the request with the same target client and cookie jar. Include current cookies in `akamai.SensorOptions.Cookies`.
+
+```go
+package main
+
+import (
+    "bytes"
+    "context"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+
+    "github.com/nullgate-club/nullgate-sdk-go/v2"
+    "github.com/nullgate-club/nullgate-sdk-go/v2/akamai"
+    "github.com/nullgate-club/nullgate-sdk-go/v2/api"
+    "github.com/nullgate-club/nullgate-sdk-go/v2/browser"
+)
+
+func run() error {
+    html, err := os.ReadFile("page.html")
+    if err != nil { return err }
+    script, err := os.ReadFile("sensor.js")
+    if err != nil { return err }
+    client, err := nullgate.New("", api.Options{})
+    if err != nil { return err }
+    defer client.Close()
+    visit, err := browser.New(browser.Options{UserAgent: os.Getenv("TARGET_USER_AGENT")})
+    if err != nil { return err }
+    page, err := visit.Page(os.Getenv("TARGET_URL"), string(html), browser.PageOptions{})
+    if err != nil { return err }
+    session, err := client.Akamai.Session(visit)
+    if err != nil { return err }
+    ctx := context.Background()
+    sensor, err := session.Sensor(ctx, page, akamai.SensorOptions{
+        Script: string(script), ScriptURL: os.Getenv("TARGET_SCRIPT_URL"),
+    })
+    if err != nil { return err }
+    if err := sensor.Wait(ctx); err != nil { return err }
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost, sensor.URL, bytes.NewReader(sensor.Body))
+    if err != nil { return err }
+    for name, value := range sensor.Headers { req.Header.Set(name, value) }
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil { return err }
+    defer resp.Body.Close()
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("target: %s", resp.Status) }
+    _, err = io.Copy(io.Discard, resp.Body)
+    return err
+}
+
+func main() {
+    if err := run(); err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
+}
+```
+
+For a complete visit with discovery and a cookie jar, run the example below.
+
 
 ```sh
 export NULLGATE_API_KEY='ng_your_key'
@@ -96,23 +156,27 @@ go run ./examples/classifier match photo.jpg 'a cat' 'a dog'
 
 The [classifier example](examples/classifier/main.go) accepts raw JPEG, PNG, or WebP files. Classify prints the best label. Match prints independent scores, which do not have to sum to one.
 
+Call `client.Classifier.Classify(ctx, classifier.ClassifyOptions{...})` with images and labels, or `client.Classifier.Match(ctx, classifier.MatchOptions{...})` with images and queries.
+
 [ACIC](examples/acic/main.go) and [ThreatMetrix](examples/threatmetrix/main.go) examples show their complete caller-owned transport flows.
 
 ## Sessions and inputs
 
-Create a session with `client.Session(nullgate.SessionOptions{UserAgent: ua})`, then create a page with `session.Page(url, html, nullgate.PageOptions{})`. Reuse the session for the same browser identity and product continuation. Create a new page for each navigation. Product states remain separate within a session. `Page.SensorURL`, `Page.PixelURL`, and `Page.SbsdURL` discover script URLs from that page. An empty result means none was found, and ambiguous discovery returns an error. Supply an explicit script URL when needed.
+Create an immutable browser identity with `browser.New(browser.Options{UserAgent: ua})`. Create each navigation with `visit.Page(url, html, browser.PageOptions{})`. Create a product session with `client.Akamai.Session(visit)` and reuse both the visit and that product session within the visit. A product session rejects a page from another visit. Other products have separate continuation state.
 
-`Page.Inputs` matches ordinary raw values by control ID or name and summarizes them locally. It rejects passwords. For passwords, use `nullgate.PrepareInputs` explicitly with an input's ID or name and value. It returns `PreparedInput` values without retaining the raw value. Do not put passwords in logs, attributes, selectors, or FWCIM extras. Optional input and action slices distinguish `nil` (omitted) from an empty slice (explicitly empty).
+`akamai.SensorURL(page)`, `akamai.PixelURL(page)`, and `akamai.SbsdURL(page)` discover script URLs. An empty result means none was found, and ambiguous discovery returns an error. Supply an explicit script URL when needed. Use `session.Sensor(ctx, page, akamai.SensorOptions{...})`, `session.Pixel(ctx, page, akamai.PixelOptions{...})`, or `session.Sbsd(ctx, page, akamai.SbsdOptions{...})`.
 
-For FWCIM, use `Page.FwcimInputs([]nullgate.Input{...})` before discarding the raw values. It computes source-compatible CRC32 checksums and includes email text for the canvas probe. It never includes password text or password checksums. Precomputed nonempty submitted nonpassword observations require `Checksum`, and the selected email also requires `Text`. Supply observed `Timing` with `navigationStart` in Unix milliseconds. If `PageOptions.StartedAtMS` is set, it must match. Supply `PreparedInput.Geometry` only when measured. Wait on the result before submitting `Metadata1` with the original form and its target cookies.
+`page.Inputs` matches ordinary raw values by control ID or name and summarizes them locally. It rejects passwords. For passwords, use `browser.PrepareInputs([]browser.Input{...})` explicitly with an input's ID or name and value. It returns `browser.PreparedInput` values without retaining the raw value. Do not put passwords in logs, attributes, selectors, or FWCIM extras. Optional input and action slices distinguish `nil` (omitted) from an empty slice (explicitly empty).
 
-For ACIC, `DiscoverAcic`, `ParseAcicResult`, `DiscoverAcicWaf`, and their setup methods prepare the challenge and continuation requests. Send these with your target client. `AcicPowResult.Wait` enforces its send time. `AcicWafResult.VerificationBody` builds the WAF verification body. The SDK does not retry ACIC generation, because a request can be billed even if its response is lost.
+For FWCIM, create and reuse `client.Amazon.Session(visit)` and call `session.Fwcim(ctx, page, amazon.FwcimOptions{...})`. Use `amazon.PrepareInputs(page, []browser.Input{...})` before discarding raw values. It returns `amazon.Input` values, which embed browser summaries and add FWCIM-only metadata. It computes source-compatible CRC32 checksums and includes email text for the canvas probe. It never includes password text or password checksums. Precomputed nonempty submitted nonpassword observations require `Checksum`, and the selected email also requires `Text`. Supply observed `Timing` with `navigationStart` in Unix milliseconds. If `browser.PageOptions.StartedAtMS` is set, it must match. Supply `amazon.Input.Geometry` only when measured. Wait on the result before submitting `Metadata1` with the original form and its target cookies.
 
-For ThreatMetrix, provide the target fetch callback and keep the startup context alive for the profile lifetime. `WaitCollected` waits for collection, `Pagehide` signals departure, and `Close` stops the profile. Ready startup alone does not mean collection or target acceptance.
+For ACIC, use `acic.Discover`, `acic.ParseResult`, and `acic.DiscoverWaf` from `amazon/acic` and their setup methods. Call `client.Amazon.ACIC.Pow` and `client.Amazon.ACIC.Waf` and send the prepared requests with your target client. `PowResult.Wait` enforces its send time. `WafResult.VerificationBody` builds the WAF verification body. The SDK does not retry ACIC generation, because a request can be billed even if its response is lost.
+
+For ThreatMetrix, create and reuse `client.ThreatMetrix.Session(visit)`, then call `session.Start(ctx, page, threatmetrix.Options{...})`. Provide the target fetch callback and keep the startup context alive for the profile lifetime. `WaitCollected` waits for collection, `Pagehide` signals departure, and `Close` stops the profile. Ready startup alone does not mean collection or target acceptance.
 
 ## Transport and reporting
 
-`Options.HTTPClient` configures only calls to the Nullgate API. It does not send target requests. The SDK copies the client and disables its cookies and redirects. Keep target cookies and proxy settings in your own client. `net/http` does not preserve wire header order. Use a suitable caller-owned transport if your target requires it.
+`api.Options.HTTPClient` configures only calls to the Nullgate API. It does not send target requests. The SDK copies the client and disables its cookies and redirects. Keep target cookies and proxy settings in your own client. `net/http` does not preserve wire header order. Use a suitable caller-owned transport if your target requires it.
 
 The SDK gzips JSON API requests of at least 1024 bytes. It can fall back to plain JSON when supported by the operation. Sensor script retention sends the script once when the server retains it, then falls back to the full script when needed. Context cancellation stops SDK waits and API operations. Your target transport and ThreatMetrix callback must honor their own contexts.
 
@@ -120,14 +184,27 @@ The SDK gzips JSON API requests of at least 1024 bytes. It can fall back to plai
 
 ## Errors
 
-Use `errors.As(err, &apiError)` with a `var apiError *nullgate.Error` to inspect `Code`, `Message`, `Status`, and `RequestID`. Default error formatting omits the message and underlying transport error to avoid printing request contents. `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` retain their usual meaning.
+Use `errors.As(err, &apiError)` with `var apiError *api.Error` to inspect `Code`, `Message`, `Status`, and `RequestID`. Error formatting includes `Message`, but not the underlying `Cause` or credentials. Use `errors.Is(err, api.ErrClosed)` for a closed client. `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` retain their usual meaning.
 
 ## Repository layout
 
-The root package exposes the client, sessions, page operations, and result types. Private API transport, document parsing, ACIC parsing, profiling protocol, and TURN handling live in `internal/`. Runnable programs live in `examples/`. There is no application server or generated `pkg/` facade.
+The root package assembles the client. Public packages own their models and operations:
+
+```text
+api/              Shared API connection, options, and errors
+accounts/         Account and usage
+browser/          Browser identity, pages, and input summaries
+akamai/           Akamai sessions and requests
+amazon/           FWCIM sessions and input metadata
+amazon/acic/      ACIC discovery and PoW/WAF
+threatmetrix/     ThreatMetrix sessions and profiles
+classifier/       Image classification and matching
+internal/         Private protocol, parsing, and transport support
+examples/         Runnable caller-owned target flows
+```
 
 ## Migration and development
 
-Version 2 is a clean replacement for the v1 branch, not a drop-in upgrade. Change imports to `github.com/nullgate-club/nullgate-sdk-go/v2` and migrate callers to the v2 API.
+Version 2 is a clean replacement for the SDK in the `v1` branch, not a drop-in upgrade. Change imports to `github.com/nullgate-club/nullgate-sdk-go/v2` and migrate callers to the v2 API. The root package has no session, options, error, or model aliases.
 
 CI runs `make setup` followed by `make check` with Go 1.24.1 or newer. See [sessions](https://nullgate.club/en/sessions) and [errors](https://nullgate.club/en/errors) for more details.
