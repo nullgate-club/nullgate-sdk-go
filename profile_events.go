@@ -6,24 +6,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nullgate-club/nullgate-sdk-go/internal/profilewire"
-	"github.com/nullgate-club/nullgate-sdk-go/internal/turn"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/profilewire"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/turn"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"golang.org/x/net/http/httpguts"
+	"regexp"
 )
-
-type profileStart struct {
-	Type      string                 `json:"type"`
-	AtMS      int64                  `json:"at_ms"`
-	Website   websitePayload         `json:"website"`
-	TagsURL   string                 `json:"tags_url,omitempty"`
-	Collector *profilewire.Collector `json:"collector,omitempty"`
-	Timezone  *string                `json:"timezone"`
-	Inputs    *[]PreparedInput       `json:"inputs,omitempty"`
-	Actions   *[]Action              `json:"actions,omitempty"`
-}
 
 type profileOperation struct {
 	kind     string
@@ -40,7 +29,7 @@ func (p *Profile) readMessages() error {
 			if p.ctx.Err() != nil {
 				return p.Err()
 			}
-			return &TransportError{Operation: "profile", RequestID: p.RequestID, Err: err}
+			return &Error{Code: "transport_error", Message: "Profile connection failed", RequestID: p.RequestID, Cause: err}
 		}
 		if kind != websocket.TextMessage {
 			return p.protocolError("expected a JSON text message")
@@ -56,26 +45,27 @@ func (p *Profile) readMessages() error {
 		case "hello":
 			var message profilewire.Hello
 			if profilewire.Decode(data, &message) != nil || hello ||
-				message.StateID == "" || !httpguts.ValidHeaderFieldValue(message.StateID) {
+				message.Session == "" || !httpguts.ValidHeaderFieldValue(message.Session) {
 				return p.protocolError("malformed or duplicate hello")
 			}
-			if _, err := uuid.Parse(message.RequestID); err != nil {
+			if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(message.RequestID) {
 				return p.protocolError("hello has an invalid request ID")
 			}
 			p.mu.Lock()
 			p.RequestID = message.RequestID
-			p.errorFormat = message.ErrorFormat == 1
 			p.mu.Unlock()
-			p.session.mu.Lock()
-			if !p.session.closed {
-				p.session.stateID = message.StateID
-			}
-			p.session.mu.Unlock()
+			p.session.rotate("threatmetrix", message.Session)
 			hello = true
 		case "http":
 			var message profilewire.HTTP
-			if profilewire.Decode(data, &message) != nil || message.ID == nil || message.Request == nil {
+			if profilewire.Decode(data, &message) != nil || message.ID == nil || *message.ID < 1 || *message.ID > 9007199254740991 || message.Request == nil {
 				return p.protocolError("malformed HTTP request")
+			}
+			var frame struct {
+				Request map[string]json.RawMessage `json:"request"`
+			}
+			if json.Unmarshal(data, &frame) != nil || frame.Request["body"] == nil {
+				return p.protocolError("malformed target HTTP request")
 			}
 			if _, exists := operations[*message.ID]; exists {
 				return p.protocolError("duplicate network correlation ID")
@@ -89,10 +79,9 @@ func (p *Profile) readMessages() error {
 			go p.serveHTTP(*message.ID, request)
 		case "ice":
 			var message profilewire.ICE
-			if profilewire.Decode(data, &message) != nil || message.ID == nil || message.Server == nil ||
-				message.Server.Host == "" || strings.ContainsAny(message.Server.Host, "\r\n\t /?#@[]") ||
-				message.Server.Port < 1 || message.Server.Port > 65535 || message.Server.Transport != "tcp" ||
-				message.Server.Username == "" || message.Server.Credential == "" {
+			if profilewire.Decode(data, &message) != nil || message.ID == nil || *message.ID < 1 || *message.ID > 9007199254740991 || message.Server == nil ||
+				message.Server.Host == "" || strings.ContainsAny(message.Server.Host, "\r\n\t /\\?#@[]") ||
+				message.Server.Port < 1 || message.Server.Port > 65535 || message.Server.Transport != "tcp" {
 				return p.protocolError("malformed TURN/TCP request")
 			}
 			if _, exists := operations[*message.ID]; exists {
@@ -146,24 +135,10 @@ func (p *Profile) readMessages() error {
 			close(ack)
 		case "error":
 			var message profilewire.ServiceError
-			if profilewire.Decode(data, &message) != nil || message.Status < 400 || message.Status > 599 ||
-				len(message.Detail) == 0 || (hello && message.RequestID != p.RequestID) {
+			if profilewire.Decode(data, &message) != nil || message.Code == "" || message.Message == "" || message.RequestID == "" {
 				return p.protocolError("malformed service error")
 			}
-			if _, err := uuid.Parse(message.RequestID); err != nil {
-				return p.protocolError("service error has an invalid request ID")
-			}
-			var detail any
-			if err := json.Unmarshal(message.Detail, &detail); err != nil {
-				return p.protocolError("malformed service error detail")
-			}
-			failure := &APIError{StatusCode: message.Status, Detail: detail, RequestID: message.RequestID, ErrorInfo: parseErrorInfo(message.Error)}
-			p.mu.Lock()
-			if info := failure.ErrorInfo; info != nil && info.Code == "CLIENT_TRANSPORT_ERROR" && info.Origin == "client" && info.CommandID != nil {
-				failure.cause = p.targetErrors[*info.CommandID]
-			}
-			p.mu.Unlock()
-			return failure
+			return &Error{Code: message.Code, Message: message.Message, RequestID: message.RequestID}
 		default:
 			return p.protocolError("unknown message kind")
 		}
@@ -177,21 +152,19 @@ func (p *Profile) serveHTTP(id int64, request TargetRequest) {
 	if p.ctx.Err() != nil {
 		return
 	}
-	if err != nil || response.Status < 100 || response.Status > 999 {
-		message := profilewire.HTTPError{Type: "http.error", ID: id, Detail: "Target request failed"}
-		p.mu.Lock()
-		if err != nil {
-			if p.targetErrors == nil {
-				p.targetErrors = make(map[int64]error)
-			}
-			p.targetErrors[id] = err
-		}
-		if p.errorFormat {
-			message.Error = transportCause(err)
-		}
-		p.mu.Unlock()
-		_ = p.send(p.ctx, message)
+	if err != nil {
+		_ = p.send(p.ctx, profilewire.HTTPError{Type: "http.error", ID: id, Detail: "Target request failed"})
 		return
+	}
+	if response.Status < 100 || response.Status > 599 {
+		p.stop(p.protocolError("target fetch returned an invalid response"))
+		return
+	}
+	for name, value := range response.Headers {
+		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			p.stop(p.protocolError("target fetch returned invalid headers"))
+			return
+		}
 	}
 	if response.Headers == nil {
 		response.Headers = map[string]string{}
@@ -211,6 +184,6 @@ func (p *Profile) serveICE(ctx context.Context, id int64, server turn.Server) {
 			Type: "ice.result", ID: id, Observation: observation,
 		})
 	}); err != nil && ctx.Err() == nil {
-		p.stop(&TransportError{Operation: "profile", RequestID: p.RequestID, Err: err})
+		p.stop(&Error{Code: "transport_error", Message: "TURN connection failed", Cause: err})
 	}
 }

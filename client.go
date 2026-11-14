@@ -1,407 +1,131 @@
+// Package nullgate prepares browser-derived target requests through the Nullgate API.
+// The caller owns target HTTP, cookies, proxies, and request submission.
 package nullgate
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
 	"errors"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/api"
 )
 
-const (
-	DefaultBaseURL        = "https://akamai.nullgate.club"
-	DefaultProfileBaseURL = "https://threatmetrix.nullgate.club"
-	DefaultAmazonBaseURL  = "https://amazon.nullgate.club"
-	DefaultAnalyticsURL   = "https://analytics.nullgate.club"
-	reportTimeout         = 3 * time.Second
-)
+const DefaultBaseURL = "https://api.nullgate.club"
 
-// Options configures only the Nullgate API, never the target website transport.
-// HTTPClient is copied, with redirects and its cookie jar disabled. Its
-// RoundTripper remains caller-owned and must be safe for concurrent requests.
+// Options configures the API connection, never the target transport.
+// HTTPClient is copied. Its transport stays caller-owned, while redirects and cookies are disabled.
 type Options struct {
-	BaseURL        string
-	ProfileBaseURL string
-	AmazonBaseURL  string
-	AnalyticsURL   string
-	HTTPClient     *http.Client
+	BaseURL    string
+	HTTPClient *http.Client
+	Timeout    time.Duration
 }
 
-// Client owns a reusable API transport. Sessions keep their state independently.
-// Use defer client.Close(); closing a client does not close a supplied transport.
+// Client is safe for concurrent use. Sessions keep independent continuation streams.
 type Client struct {
-	apiKey         string
-	baseURL        string
-	profileBaseURL string
-	amazonBaseURL  string
-	analyticsURL   string
-	http           *http.Client
-	ownsTransport  bool
-	closed         atomic.Bool
-	done           chan struct{}
-	profilesMu     sync.Mutex
-	profiles       map[*Profile]struct{}
+	api           *api.Client
+	ownsTransport bool
+	profilesMu    sync.Mutex
+	profiles      map[*Profile]struct{}
 }
 
-func (c *Client) String() string   { return "nullgate.Client{APIKey:<redacted>}" }
+func (*Client) String() string     { return "nullgate.Client{APIKey:<redacted>}" }
 func (c *Client) GoString() string { return c.String() }
 
-// NewClient validates configuration without making any network requests.
+// NewClient validates configuration without network I/O.
+// An empty key reads NULLGATE_API_KEY. The default timeout is 30 seconds.
 func NewClient(apiKey string, options Options) (*Client, error) {
-	if !strings.HasPrefix(apiKey, "ng_") || strings.TrimSpace(apiKey) != apiKey || strings.ContainsAny(apiKey, "\r\n\t ") {
-		return nil, errors.New("nullgate: API key must be an ng_ credential without whitespace")
+	if apiKey == "" {
+		apiKey = os.Getenv("NULLGATE_API_KEY")
 	}
-	if options.BaseURL == "" {
-		options.BaseURL = DefaultBaseURL
+	if !strings.HasPrefix(apiKey, "ng_") || len(apiKey) <= 3 || strings.ContainsAny(apiKey, " \t\r\n") {
+		return nil, newError("invalid_request", "API key must be an ng_ credential without whitespace")
 	}
-	if options.AnalyticsURL == "" {
-		options.AnalyticsURL = DefaultAnalyticsURL
+	base := options.BaseURL
+	if base == "" {
+		base = DefaultBaseURL
 	}
-	if options.ProfileBaseURL == "" {
-		options.ProfileBaseURL = DefaultProfileBaseURL
+	u, err := absoluteHTTPURL(base)
+	if err != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, newError("invalid_url", "BaseURL must be an absolute HTTP(S) URL without credentials, query or fragment")
 	}
-	if options.AmazonBaseURL == "" {
-		options.AmazonBaseURL = DefaultAmazonBaseURL
+	timeout := options.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
 	}
-	amazonBase, err := apiBase(options.AmazonBaseURL)
-	if err != nil {
-		return nil, errors.New("nullgate: AmazonBaseURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	if timeout < 0 {
+		return nil, newError("invalid_request", "Timeout must be positive")
 	}
-	base, err := apiBase(options.BaseURL)
-	if err != nil {
-		return nil, errors.New("nullgate: BaseURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
-	}
-	analytics, err := apiBase(options.AnalyticsURL)
-	if err != nil {
-		return nil, errors.New("nullgate: AnalyticsURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
-	}
-	profileBase, err := apiBase(options.ProfileBaseURL)
-	if err != nil {
-		return nil, errors.New("nullgate: ProfileBaseURL must be an absolute HTTP(S) URL without credentials, query, or fragment")
-	}
-	var api http.Client
-	ownsTransport := false
+	var httpClient http.Client
+	owns := false
 	if options.HTTPClient != nil {
-		api = *options.HTTPClient
+		httpClient = *options.HTTPClient
 	} else if transport, ok := http.DefaultTransport.(*http.Transport); ok {
-		api.Transport = transport.Clone()
-		ownsTransport = true
+		httpClient.Transport = transport.Clone()
+		owns = true
+	} else {
+		httpClient.Transport = http.DefaultTransport
 	}
-	if api.Timeout <= 0 {
-		api.Timeout = 30 * time.Second
+	httpClient.Jar = nil
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if httpClient.Timeout == 0 || httpClient.Timeout > timeout {
+		httpClient.Timeout = timeout
 	}
-	api.Jar = nil
-	api.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{
-		apiKey: apiKey, baseURL: base, profileBaseURL: profileBase, amazonBaseURL: amazonBase, analyticsURL: analytics,
-		http: &api, ownsTransport: ownsTransport, done: make(chan struct{}),
-	}, nil
+	return &Client{api: api.New(apiKey, strings.TrimRight(u.String(), "/"), &httpClient, timeout), ownsTransport: owns, profiles: make(map[*Profile]struct{})}, nil
 }
 
-func apiBase(raw string) (string, error) {
-	u, err := absoluteHTTPURL(raw)
-	if err != nil || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return "", errors.New("invalid API base URL")
+func absoluteHTTPURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || strings.ContainsAny(raw, "\r\n\x00") {
+		return nil, newError("invalid_url", "Expected an absolute HTTP(S) URL without credentials")
 	}
-	return strings.TrimRight(u.String(), "/"), nil
+	return u, nil
 }
 
-// SessionOptions binds one isolated continuation stream to a UUID and browser
-// user agent. A non-nil Timezone is sent unchanged on each generation request.
-type SessionOptions struct {
-	Identity  string
-	UserAgent string
-	Timezone  *string
-}
-
-// Session serializes Akamai/ThreatMetrix generation and Amazon generation in
-// independent continuation streams. Each context-aware gate permits cancellation
-// while another generation in that stream is in flight.
-type Session struct {
-	client         *Client
-	identity       string
-	userAgent      string
-	timezone       *string
-	gate           chan struct{}
-	amazonGate     chan struct{}
-	mu             sync.Mutex
-	stateID        string
-	document       websitePayload
-	amazonStateID  string
-	amazonDocument websitePayload
-	closed         bool
-	done           chan struct{}
-	profiles       map[*Profile]struct{}
-}
-
-func (s *Session) String() string   { return "nullgate.Session{State:<redacted>}" }
-func (s *Session) GoString() string { return s.String() }
-
-// Open creates a new state stream without contacting the service.
-func (c *Client) Open(options SessionOptions) (*Session, error) {
-	if c.closed.Load() {
-		return nil, ErrClosed
-	}
-	identity, err := uuid.Parse(options.Identity)
-	if err != nil {
-		return nil, errors.New("nullgate: Identity must be a UUID")
-	}
-	if strings.TrimSpace(options.UserAgent) == "" || strings.ContainsAny(options.UserAgent, "\r\n") {
-		return nil, errors.New("nullgate: UserAgent must be a nonempty HTTP header value")
-	}
-	var timezone *string
-	if options.Timezone != nil {
-		value := *options.Timezone
-		timezone = &value
-	}
-	state, err := uuid.NewRandom()
-	if err != nil {
-		return nil, errors.New("nullgate: could not create session state")
-	}
-	amazonState, err := uuid.NewRandom()
-	if err != nil {
-		return nil, errors.New("nullgate: could not create Amazon session state")
-	}
-	return &Session{
-		client: c, identity: identity.String(), userAgent: options.UserAgent,
-		timezone: timezone, gate: make(chan struct{}, 1), stateID: state.String(),
-		amazonStateID: amazonState.String(), amazonGate: make(chan struct{}, 1), done: make(chan struct{}),
-	}, nil
-}
-
-// Solve calls only Nullgate. It neither sends to the target nor retries a
-// generation. Continuation headers are retained even on API/protocol failures.
-func (s *Session) Solve(ctx context.Context, params Params) (*Solution, error) {
-	if ctx == nil {
-		return nil, errors.New("nullgate: context must not be nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	select {
-	case s.gate <- struct{}{}:
-		defer func() { <-s.gate }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.done:
-		return nil, ErrClosed
-	case <-s.client.done:
-		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	stateID, previous, closed := s.stateID, s.document, s.closed
-	s.mu.Unlock()
-	if closed || s.client.closed.Load() {
-		return nil, ErrClosed
-	}
-	operation, payload, target, err := generationPayload(params, s.timezone, previous)
-	if err != nil {
-		return nil, err
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, errors.New("nullgate: generation params must contain JSON-serializable values")
-	}
-	endpoint := s.client.baseURL + "/v1/" + s.identity + "/generate?type=" + operation
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, &TransportError{Operation: "generate", Err: err}
-	}
-	request.GetBody = nil // Do not replay a failed POST on a reused connection.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	if s.closed || s.client.closed.Load() {
-		s.mu.Unlock()
-		return nil, ErrClosed
-	}
-	s.document = payload.Website
-	s.mu.Unlock()
-	request.Header.Set("Authorization", "Bearer "+s.client.apiKey)
-	request.Header.Set("X-Nullgate-Error-Format", "1")
-	request.Header.Set("User-Agent", s.userAgent)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-State-ID", stateID)
-	response, err := s.generationRequest(request, body)
-	if err != nil {
-		if errors.Is(err, ErrClosed) {
-			return nil, ErrClosed
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, &TransportError{Operation: "generate", Err: err}
-	}
-	defer response.Body.Close()
-	s.mu.Lock()
-	if values, exists := response.Header[http.CanonicalHeaderKey("X-State-ID")]; exists && !s.closed {
-		s.stateID = ""
-		if len(values) > 0 {
-			s.stateID = values[0]
-		}
-	}
-	closed = s.closed
-	s.mu.Unlock()
-	if closed || s.client.closed.Load() {
-		return nil, ErrClosed
-	}
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, &TransportError{Operation: "generate", Err: err}
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, responseError(response, data)
-	}
-	return normalizeSolution(response, data, operation, target, s.client)
-}
-
-// Close discards this stream's state and closes its active profiles. It does
-// not close the client or change cancellation of in-flight Solve requests.
-func (s *Session) Close() error {
-	s.mu.Lock()
-	if !s.closed {
-		close(s.done)
-	}
-	s.closed, s.stateID, s.document = true, "", websitePayload{}
-	s.amazonStateID, s.amazonDocument = "", websitePayload{}
-	profiles := make([]*Profile, 0, len(s.profiles))
-	for profile := range s.profiles {
-		profiles = append(profiles, profile)
-	}
-	s.mu.Unlock()
-	for _, profile := range profiles {
-		profile.stop(ErrClosed)
-	}
-	for _, profile := range profiles {
-		<-profile.done
-	}
-	return nil
-}
-
-// Close prevents new API calls and closes active profiles and owned idle
-// connections. Caller-supplied pools stay open; Solve keeps its caller context.
+// Close stops active profiles and requests, and closes only SDK-owned idle connections.
 func (c *Client) Close() error {
-	c.profilesMu.Lock()
-	alreadyClosed := c.closed.Swap(true)
-	if !alreadyClosed {
-		close(c.done)
+	if !c.api.Close() {
+		return nil
 	}
-	profiles := make([]*Profile, 0, len(c.profiles))
-	for profile := range c.profiles {
-		profiles = append(profiles, profile)
+	c.profilesMu.Lock()
+	active := make([]*Profile, 0, len(c.profiles))
+	for p := range c.profiles {
+		active = append(active, p)
 	}
 	c.profilesMu.Unlock()
-	for _, profile := range profiles {
-		profile.stop(ErrClosed)
+	for _, p := range active {
+		_ = p.Close()
 	}
-	for _, profile := range profiles {
-		<-profile.done
-	}
-	if !alreadyClosed && c.ownsTransport {
-		c.http.CloseIdleConnections()
+	if c.ownsTransport {
+		c.api.HTTP.CloseIdleConnections()
 	}
 	return nil
 }
 
-// Report delivers only {request_id} to analytics, without authorization, state,
-// target cookies, redirects, or retries. True means HTTP delivery, not archive
-// acceptance, target failure attribution, or a refund. Remote/network failure
-// returns false,nil; caller cancellation and programming errors remain errors.
+// Public errors keep one contract, independent of private wire implementations.
+func publicError(err error) error {
+	if errors.Is(err, api.ErrClosed) {
+		return ErrClosed
+	}
+	var value *api.Error
+	if errors.As(err, &value) {
+		return &Error{Code: value.Code, Message: value.Message, RequestID: value.RequestID, Status: value.Status, Cause: value.Cause}
+	}
+	return err
+}
+func (c *Client) call(ctx context.Context, path string, body map[string]any, out any, script string, retry bool) error {
+	return publicError(c.api.Call(ctx, path, body, out, script, retry))
+}
+
+// Report records a request ID. True means HTTP delivery, not acceptance or a refund.
 func (c *Client) Report(ctx context.Context, requestID string) (bool, error) {
-	if ctx == nil {
-		return false, errors.New("nullgate: context must not be nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	if c.closed.Load() {
-		return false, ErrClosed
-	}
 	if requestID == "" {
-		return false, errors.New("nullgate: request ID must not be empty")
+		return false, newError("invalid_request", "RequestID must not be empty")
 	}
-	body, _ := json.Marshal(struct {
-		RequestID string `json:"request_id"`
-	}{RequestID: requestID})
-	reportCtx, cancel := context.WithTimeout(ctx, reportTimeout)
-	defer cancel()
-	request, err := http.NewRequestWithContext(reportCtx, http.MethodPost, c.analyticsURL+"/report", bytes.NewReader(body))
-	if err != nil {
-		return false, &TransportError{Operation: "report", Err: err}
-	}
-	request.GetBody = nil
-	request.Header.Set("Content-Type", "application/json")
-	response, err := c.http.Do(request)
-	if err != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		if reportCtx.Err() != nil || remoteFailure(err) {
-			return false, nil
-		}
-		return false, &TransportError{Operation: "report", Err: err}
-	}
-	defer response.Body.Close()
-	_, err = io.Copy(io.Discard, response.Body)
-	if ctx.Err() != nil {
-		return false, ctx.Err()
-	}
-	if err != nil {
-		if reportCtx.Err() != nil || remoteFailure(err) {
-			return false, nil
-		}
-		return false, &TransportError{Operation: "report", Err: err}
-	}
-	return response.StatusCode >= 200 && response.StatusCode < 300, nil
-}
-
-func remoteFailure(err error) bool {
-	var request *url.Error
-	if errors.As(err, &request) {
-		err = request.Err
-	}
-	var network net.Error
-	var protocol *http.ProtocolError
-	var verification *tls.CertificateVerificationError
-	var authority x509.UnknownAuthorityError
-	var hostname x509.HostnameError
-	var certificate x509.CertificateInvalidError
-	return errors.As(err, &network) || errors.As(err, &protocol) ||
-		errors.As(err, &verification) || errors.As(err, &authority) ||
-		errors.As(err, &hostname) || errors.As(err, &certificate) ||
-		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-func responseError(response *http.Response, body []byte) *APIError {
-	var detail any
-	var envelope struct {
-		Error json.RawMessage `json:"error"`
-	}
-	_ = json.Unmarshal(body, &envelope)
-	if err := json.Unmarshal(body, &detail); err != nil {
-		detail = string(body)
-	} else if object, ok := detail.(map[string]any); ok {
-		if value, exists := object["detail"]; exists {
-			detail = value
-		}
-	}
-	return &APIError{StatusCode: response.StatusCode, Detail: detail, RequestID: response.Header.Get("X-Request-ID"), ErrorInfo: parseErrorInfo(envelope.Error)}
+	delivered, err := c.api.Report(ctx, requestID)
+	return delivered, publicError(err)
 }

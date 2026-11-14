@@ -1,472 +1,191 @@
 package nullgate_test
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	nullgate "github.com/nullgate-club/nullgate-sdk-go"
+	ng "github.com/nullgate-club/nullgate-sdk-go/v2"
 )
 
-const identity = "550e8400-e29b-41d4-a716-446655440000"
-const apiKey = "ng_test_credential_never_for_target"
+const accountJSON = `{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","balance":"1.234567","currency":"USD","created_at":"2026-11-01T00:00:00Z","active":true,"prices_per_1000":{"akamai.sensor":"2.500000"},"usage":[]}`
 
-var page = nullgate.Page{URL: "https://target.example/login", HTML: "<html>private original document</html>"}
-var sensor = nullgate.Sensor{Page: page, ScriptURL: "https://target.example/collector?raw=1"}
-
-func clientFor(t *testing.T, server *httptest.Server) *nullgate.Client {
-	t.Helper()
-	client, err := nullgate.NewClient(apiKey, nullgate.Options{BaseURL: server.URL, AnalyticsURL: server.URL, HTTPClient: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { client.Close() })
-	return client
-}
-
-func sessionFor(t *testing.T, client *nullgate.Client) *nullgate.Session {
-	t.Helper()
-	session, err := client.Open(nullgate.SessionOptions{Identity: identity, UserAgent: "Chrome146 test agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { session.Close() })
-	return session
-}
-
-func writeSensor(w http.ResponseWriter) {
-	w.Header().Set("X-Request-ID", "11111111111111111111111111111111")
-	fmt.Fprint(w, `{"sensor_data":"encoded-sensor","headers":{},"send_at":0}`)
-}
-
-func TestSolveBuildsOperationPayloadsAndReadyPosts(t *testing.T) {
-	for _, kind := range []string{"pixel", "akamai", "sbsd"} {
-		t.Run(kind, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodPost || r.URL.Path != "/v1/"+identity+"/generate" || r.URL.Query().Get("type") != kind {
-					t.Errorf("wrong generate endpoint: %s %s", r.Method, r.URL)
-				}
-				if r.Header.Get("Authorization") != "Bearer "+apiKey || r.Header.Get("User-Agent") != "Chrome146 test agent" || r.Header.Get("Cookie") != "" {
-					t.Error("generation authorization, identity headers, or cookie scoping is wrong")
-				}
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					t.Error(err)
-				}
-				if strings.Contains(string(body), "pass🔒42") {
-					t.Error("raw input password crossed the API boundary")
-				}
-				var payload map[string]any
-				if err := json.Unmarshal(body, &payload); err != nil {
-					t.Error(err)
-				}
-				wantSource := sensor.ScriptURL
-				if kind == "pixel" {
-					wantSource = "https://target.example/akam/13/ab?original=1"
-					if payload["challenge"] != "123" {
-						t.Error("pixel challenge was not taken from its protection")
-					}
-				} else if kind == "sbsd" {
-					wantSource = "https://target.example/probe?v=" + identity
-				}
-				if !reflect.DeepEqual(payload["script"], map[string]any{"source": wantSource, "text": "raw script source"}) {
-					t.Error("source URL/query or raw script provenance was lost")
-				}
-				if kind == "akamai" {
-					inputs := payload["inputs"].([]any)
-					summary := inputs[0].(map[string]any)["value"].(map[string]any)
-					if summary["hash"] != "ef58f7cdc313fe3a99cd72fee551003c739c02465323f36ac500da0148cc6824" || summary["length"] != float64(8) {
-						t.Error("sensor inputs were not summarized locally with UTF-16 semantics")
-					}
-					if !reflect.DeepEqual(payload["cookies"], map[string]any{"bm_sz": "target-cookie"}) || !reflect.DeepEqual(payload["actions"], []any{map[string]any{"type": "mousemove", "x": float64(2)}}) {
-						t.Error("sensor cookies or actions changed")
-					}
-				}
-				w.Header().Set("X-Request-ID", "diagnostic-request-id")
-				if kind == "akamai" {
-					fmt.Fprint(w, `{"sensor_data":"payload\"😀","send_at":1234.5,"headers":{"content-type":"application/json","CONTENT-TYPE":"wrong","Accept-Language":"en-US"}}`)
-				} else {
-					fmt.Fprint(w, `{"url":"https://target.example/returned?keep=1","body":"raw=%2B&x=1","send_at":1234.5,"headers":{"Accept-Language":"en-US"}}`)
-				}
-			}))
-			defer server.Close()
-			client := clientFor(t, server)
-			timezone := "Europe/Berlin"
-			session, err := client.Open(nullgate.SessionOptions{Identity: identity, UserAgent: "Chrome146 test agent", Timezone: &timezone})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer session.Close()
-			timezone = "caller-mutated-timezone"
-			var params nullgate.Params
-			wantType := "application/x-www-form-urlencoded"
-			wantURL, wantBody := "https://target.example/returned?keep=1", "raw=%2B&x=1"
-			switch kind {
-			case "pixel":
-				params = nullgate.PixelParams{Protection: nullgate.Pixel{Page: page, ScriptURL: "https://target.example/akam/13/ab?original=1", Challenge: "123"}, Script: "raw script source"}
-			case "akamai":
-				params = nullgate.SensorParams{Protection: sensor, Script: "raw script source", Cookies: map[string]string{"bm_sz": "target-cookie"}, Inputs: []nullgate.Input{{"type": "password", "value": "pass🔒42"}}, Actions: []nullgate.Action{{"type": "mousemove", "x": 2}}}
-				wantURL, wantBody, wantType = sensor.ScriptURL, "", "text/plain;charset=UTF-8"
-			case "sbsd":
-				params = &nullgate.SbsdParams{Protection: nullgate.Sbsd{Page: page, ScriptURL: "https://target.example/probe?v=" + identity}, Script: "raw script source"}
-				wantType = "application/json"
-			}
-			solution, err := session.Solve(context.Background(), params)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if solution.Method != "POST" || solution.URL != wantURL || solution.SendAt != 1234.5 || solution.RequestID != "diagnostic-request-id" {
-				t.Error("solution did not preserve the actual target and diagnostic metadata")
-			}
-			if !reflect.DeepEqual(solution.Headers, map[string]string{"Content-Type": wantType, "Accept-Language": "en-US"}) {
-				t.Errorf("target headers were not normalized: %v", solution.Headers)
-			}
-			if kind == "akamai" {
-				var decoded map[string]string
-				if err := json.Unmarshal([]byte(solution.Body), &decoded); err != nil || !reflect.DeepEqual(decoded, map[string]string{"sensor_data": "payload\"😀"}) {
-					t.Error("sensor body was not encoded once as a JSON object")
-				}
-			} else if solution.Body != wantBody {
-				t.Error("already-encoded target body was changed or double-JSON encoded")
-			}
-		})
-	}
-}
-
-func TestSensorNilAndEmptyInputsActionsAreDifferent(t *testing.T) {
-	bodies := make(chan map[string]json.RawMessage, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
-		}
-		bodies <- body
-		writeSensor(w)
-	}))
-	defer server.Close()
-	session := sessionFor(t, clientFor(t, server))
-	for _, params := range []nullgate.SensorParams{
-		{Protection: sensor, Script: "source"},
-		{Protection: sensor, Script: "source", Inputs: []nullgate.Input{}, Actions: []nullgate.Action{}},
-	} {
-		if _, err := session.Solve(context.Background(), params); err != nil {
-			t.Fatal(err)
-		}
-	}
-	first, second := <-bodies, <-bodies
-	for _, key := range []string{"inputs", "actions"} {
-		if _, exists := first[key]; exists {
-			t.Errorf("nil %s must be omitted", key)
-		}
-		if string(second[key]) != "[]" {
-			t.Errorf("empty %s must be [], not null or omitted", key)
-		}
-	}
-	if string(first["cookies"]) != "{}" || string(second["cookies"]) != "{}" {
-		t.Error("nil cookies must be the service's empty object")
-	}
-}
-
-func TestRawInputAndChangeActionsFailBeforeTransport(t *testing.T) {
-	client, err := nullgate.NewClient(apiKey, nullgate.Options{
-		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			t.Error("raw action input reached the transport")
-			return nil, errors.New("unexpected transport call")
-		})},
-	})
+// A redirect must never forward an API key to a different server.
+func TestAPIRedirectDoesNotLeakCredentials(t *testing.T) {
+	var reached atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached.Store(true); io.WriteString(w, accountJSON) }))
+	defer target.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, target.URL, 307) }))
+	defer api.Close()
+	provided := &http.Client{}
+	client, err := ng.NewClient("ng_secret", ng.Options{BaseURL: api.URL, HTTPClient: provided})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	session := sessionFor(t, client)
-	for _, kind := range []string{"input", "change"} {
-		for _, raw := range []string{"private-password", ""} {
-			params := nullgate.SensorParams{Protection: sensor, Script: "source", Actions: []nullgate.Action{{"type": kind, "target": 0, "value": raw}}}
-			if _, err := session.Solve(context.Background(), params); err == nil {
-				t.Errorf("accepted raw %s action value", kind)
-			} else if strings.Contains(err.Error(), "private-password") {
-				t.Error("action validation exposed private input text")
-			}
-		}
+	_, err = client.Account(context.Background())
+	var failure *ng.Error
+	if !errors.As(err, &failure) || failure.Status != 307 || reached.Load() {
+		t.Fatalf("redirect was not rejected: err=%v target=%v", err, reached.Load())
+	}
+	if provided.CheckRedirect != nil {
+		t.Fatal("caller HTTP client was modified")
 	}
 }
 
-func TestActionSummariesAndNullMissingValuesArePreserved(t *testing.T) {
-	bodies := make(chan map[string]json.RawMessage, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
-		}
-		bodies <- body
-		writeSensor(w)
-	}))
-	defer server.Close()
-	session := sessionFor(t, clientFor(t, server))
-	summary := nullgate.InputValue{Length: 8, Hash: "ef58f7cdc313fe3a99cd72fee551003c739c02465323f36ac500da0148cc6824", Counts: [4]int{8, 2, 4, 2}}
-	actions := []nullgate.Action{
-		{"type": "input", "value": summary},
-		{"type": "change", "value": summary},
-		{"type": "input", "value": nil},
-		{"type": "change"},
-		{"type": "keypress", "value": "Enter"},
-	}
-	if _, err := session.Solve(context.Background(), nullgate.SensorParams{Protection: sensor, Script: "source", Actions: actions}); err != nil {
-		t.Fatal(err)
-	}
-	want := `[{"type":"input","value":{"length":8,"hash":"ef58f7cdc313fe3a99cd72fee551003c739c02465323f36ac500da0148cc6824","counts":[8,2,4,2]}},{"type":"change","value":{"length":8,"hash":"ef58f7cdc313fe3a99cd72fee551003c739c02465323f36ac500da0148cc6824","counts":[8,2,4,2]}},{"type":"input","value":null},{"type":"change"},{"type":"keypress","value":"Enter"}]`
-	var actual, expected any
-	if err := json.Unmarshal((<-bodies)["actions"], &actual); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal([]byte(want), &expected); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(actual, expected) {
-		t.Errorf("valid action values changed: %v", actual)
-	}
-}
-
-func TestStateRotatesOnErrorsRetainsWhenAbsentAndIsolatesSessions(t *testing.T) {
-	var states []string
-	var stateMu sync.Mutex
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stateMu.Lock()
-		defer stateMu.Unlock()
-		states = append(states, r.Header.Get("X-State-ID"))
-		switch len(states) {
-		case 1:
-			w.Header().Set("X-State-ID", "error-state")
-			w.Header().Set("X-Request-ID", "error-request")
-			w.WriteHeader(422)
-			fmt.Fprint(w, `{"detail":{"reason":"source not supported"}}`)
-		case 2:
-			w.WriteHeader(503)
-			fmt.Fprint(w, "remote unavailable")
-		case 3:
-			w.Header().Set("X-State-ID", "rotated-state")
-			writeSensor(w)
-		default:
-			writeSensor(w)
-		}
-	}))
-	defer server.Close()
-	client := clientFor(t, server)
-	session := sessionFor(t, client)
-	params := nullgate.SensorParams{Protection: sensor, Script: "source"}
-	_, err := session.Solve(context.Background(), params)
-	var apiError *nullgate.APIError
-	if !errors.As(err, &apiError) || apiError.StatusCode != 422 || apiError.RequestID != "error-request" || !reflect.DeepEqual(apiError.Detail, map[string]any{"reason": "source not supported"}) {
-		t.Fatalf("structured API error lost status/detail/request ID: %v", err)
-	}
-	_, err = session.Solve(context.Background(), params)
-	if !errors.As(err, &apiError) || apiError.StatusCode != 503 || apiError.Detail != "remote unavailable" {
-		t.Fatal("non-JSON API error lost its original detail")
-	}
-	for range 2 {
-		if _, err := session.Solve(context.Background(), params); err != nil {
-			t.Fatal(err)
-		}
-	}
-	other := sessionFor(t, client)
-	if _, err := other.Solve(context.Background(), params); err != nil {
-		t.Fatal(err)
-	}
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	if states[0] == "" || states[4] == "" || states[0] == states[4] || states[4] == "rotated-state" {
-		t.Errorf("sessions did not begin with isolated local state IDs: %q", states)
-	}
-	if states[1] != "error-state" || states[2] != "error-state" || states[3] != "rotated-state" {
-		t.Errorf("response rotations were not retained across failures: %q", states)
-	}
-}
-
-func TestSessionTracksDiscoveredDocumentsAcrossProtections(t *testing.T) {
-	source := nullgate.Page{
-		URL: "https://target.example/login",
-		HTML: `<script src="/sensor"></script><script>bazadebezolkohpepadr="123";</script>` +
-			`<script src="/akam/13/ab"></script><script src="/probe?v=` + identity + `"></script>`,
-	}
-	acquiredAt := time.Now().UnixMilli()
-	first, err := nullgate.FindProtections(source, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := nullgate.FindProtections(source, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	type observation struct {
-		documentID, stateID, userAgent, path, timezone string
-		startedAtMS                                    int64
-	}
-	seen := make(chan observation, 6)
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload struct {
-			Website struct {
-				DocumentID  string `json:"document_id"`
-				StartedAtMS int64  `json:"started_at_ms"`
-			} `json:"website"`
-			Timezone string `json:"timezone"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Error(err)
-		}
-		seen <- observation{
-			payload.Website.DocumentID, r.Header.Get("X-State-ID"),
-			r.Header.Get("User-Agent"), r.URL.Path, payload.Timezone, payload.Website.StartedAtMS,
-		}
-		calls++
-		if calls == 2 {
-			w.Header().Set("X-State-ID", "server-rotation")
-		}
-		if r.URL.Query().Get("type") == "akamai" {
-			writeSensor(w)
-		} else {
-			w.Header().Set("X-Request-ID", "discovery-request")
-			fmt.Fprint(w, `{"url":"https://target.example/post","body":"encoded","send_at":0,"headers":{}}`)
-		}
-	}))
-	defer server.Close()
-	timezone := "Europe/Berlin"
-	session, err := clientFor(t, server).Open(nullgate.SessionOptions{Identity: identity, UserAgent: "document-agent", Timezone: &timezone})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	for _, protection := range []nullgate.Protection{first[0], first[1], first[2], first[0], second[0], second[0]} {
-		var params nullgate.Params
-		switch p := protection.(type) {
-		case nullgate.Sensor:
-			params = nullgate.SensorParams{Protection: p, Script: "source"}
-		case nullgate.Pixel:
-			params = nullgate.PixelParams{Protection: p, Script: "source"}
-		case nullgate.Sbsd:
-			params = nullgate.SbsdParams{Protection: p, Script: "source"}
-		default:
-			t.Fatalf("unexpected protection type %T", protection)
-		}
-		if _, err := session.Solve(context.Background(), params); err != nil {
-			t.Fatal(err)
-		}
-	}
-	firstRequest := <-seen
-	if firstRequest.documentID == "" || firstRequest.stateID == "" || firstRequest.startedAtMS < acquiredAt || firstRequest.startedAtMS > time.Now().UnixMilli() {
-		t.Fatal("first solve did not carry a local document observation and state")
-	}
-	var newDocument observation
-	for i := 1; i < 6; i++ {
-		current := <-seen
-		if current.userAgent != firstRequest.userAgent || current.path != firstRequest.path || current.timezone != firstRequest.timezone {
-			t.Error("changing document or protection changed the bound browser identity")
-		}
-		if i < 4 {
-			if current.documentID != firstRequest.documentID || current.startedAtMS != firstRequest.startedAtMS {
-				t.Error("protections from one discovery did not share the document observation")
+// A server without gzip support must receive a safe replay and future uncompressed requests.
+func TestGzipNegotiationPreservesSensorContinuation(t *testing.T) {
+	requests := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			if r.Header.Get("Content-Encoding") != "gzip" {
+				t.Error("first large request was not gzipped")
 			}
-			wantState := firstRequest.stateID
-			if i >= 2 {
-				wantState = "server-rotation"
-			}
-			if current.stateID != wantState {
-				t.Error("same-document solves lost their local or response-rotated state")
-			}
-		} else if i == 4 {
-			if current.documentID == firstRequest.documentID || current.stateID != "server-rotation" {
-				t.Error("a newly acquired document must change its observation, not session state")
-			}
-			newDocument = current
-		} else if current.documentID != newDocument.documentID || current.startedAtMS != newDocument.startedAtMS || current.stateID != newDocument.stateID {
-			t.Error("repeated solves changed the new document's observation or state")
-		}
-	}
-}
-
-func TestSessionCancellationWhileQueuedAndParallelSessionIndependence(t *testing.T) {
-	started, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("User-Agent") == "blocked-session" {
-			once.Do(func() { close(started) })
-			select {
-			case <-release:
-			case <-r.Context().Done():
+			reader, err := gzip.NewReader(r.Body)
+			if err != nil {
+				t.Error(err)
 				return
 			}
+			_, _ = io.Copy(io.Discard, reader)
+			reader.Close()
+			w.WriteHeader(415)
+			io.WriteString(w, `{"code":"invalid_request","message":"unsupported encoding","request_id":"e"}`)
+			return
 		}
-		writeSensor(w)
+		if r.Header.Get("Content-Encoding") != "" {
+			t.Error("gzip was not disabled")
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		if requests == 3 && (body["session"] != "continued" || body["script_digest"] == nil || body["script"] != nil) {
+			t.Error("continuation lost during compression negotiation")
+		}
+		io.WriteString(w, `{"session":"continued","script_retained":true,"request_id":"r","request":{"url":"https://target.test/sensor","body":"generated","headers":{},"send_at":0}}`)
 	}))
-	defer server.Close()
-	defer close(release)
-	client := clientFor(t, server)
-	blocked, err := client.Open(nullgate.SessionOptions{Identity: identity, UserAgent: "blocked-session"})
+	defer api.Close()
+	client, err := ng.NewClient("ng_test", ng.Options{BaseURL: api.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer blocked.Close()
-	params := nullgate.SensorParams{Protection: sensor, Script: "source"}
-	firstCtx, cancelFirst := context.WithCancel(context.Background())
-	defer cancelFirst()
-	firstDone := make(chan error, 1)
-	go func() { _, err := blocked.Solve(firstCtx, params); firstDone <- err }()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first request never reached the service")
+	defer client.Close()
+	session, err := client.Session(ng.SessionOptions{UserAgent: "browser"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	queuedCtx, cancelQueued := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancelQueued()
-	queuedDone := make(chan error, 1)
-	go func() { _, err := blocked.Solve(queuedCtx, params); queuedDone <- err }()
-	select {
-	case err := <-queuedDone:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("queued cancellation was lost: %v", err)
+	page, err := session.Page("https://target.test/", "<html>"+strings.Repeat("x", 3000)+"</html>", ng.PageOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		result, err := page.Sensor(context.Background(), ng.SensorOptions{Script: "source", ScriptURL: "/sensor"})
+		if err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("queued solve ignored its context while another request held the session")
+		if result.URL != "https://target.test/sensor" || result.Headers["origin"] != "https://target.test" {
+			t.Fatal("target request context was lost")
+		}
 	}
-	other := sessionFor(t, client)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if _, err := other.Solve(ctx, params); err != nil {
-		t.Fatalf("independent session was blocked by another session: %v", err)
-	}
-	cancelFirst()
-	if err := <-firstDone; !errors.Is(err, context.Canceled) {
-		t.Errorf("in-flight cancellation was lost: %v", err)
+	if requests != 3 {
+		t.Fatalf("got %d requests, want one negotiation plus two generations", requests)
 	}
 }
 
-func TestClosedClientAndSessionCannotContinue(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("closed stream performed network I/O")
-		writeSensor(w)
+// Only explicit maintenance denial may replay an ordinary API operation.
+func TestMaintenanceAndMalformedAccount(t *testing.T) {
+	calls := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(503)
+			io.WriteString(w, `{"code":"maintenance","message":"draining","request_id":"r"}`)
+			return
+		}
+		if calls == 2 {
+			io.WriteString(w, accountJSON)
+			return
+		}
+		io.WriteString(w, `{"id":"id","balance":1.234567}`)
 	}))
-	defer server.Close()
-	client := clientFor(t, server)
-	session := sessionFor(t, client)
-	session.Close()
-	if _, err := session.Solve(context.Background(), nullgate.SensorParams{Protection: sensor, Script: "source"}); !errors.Is(err, nullgate.ErrClosed) {
-		t.Errorf("closed session: %v", err)
+	defer api.Close()
+	client, err := ng.NewClient("ng_test", ng.Options{BaseURL: api.URL})
+	if err != nil {
+		t.Fatal(err)
 	}
-	other := sessionFor(t, client)
-	client.Close()
-	if _, err := other.Solve(context.Background(), nullgate.SensorParams{Protection: sensor, Script: "source"}); !errors.Is(err, nullgate.ErrClosed) {
-		t.Errorf("client close did not close its streams: %v", err)
+	defer client.Close()
+	account, err := client.Account(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := client.Open(nullgate.SessionOptions{Identity: identity, UserAgent: "agent"}); !errors.Is(err, nullgate.ErrClosed) {
-		t.Errorf("closed client opened a new stream: %v", err)
+	if account.Balance != "1.234567" || account.PricesPer1000["akamai.sensor"] != "2.500000" {
+		t.Fatal("decimal amounts were not preserved")
+	}
+	_, err = client.Account(context.Background())
+	var failure *ng.Error
+	if !errors.As(err, &failure) || failure.Code != "protocol_error" || calls != 3 {
+		t.Fatalf("malformed account was accepted or replayed: %v calls=%d", err, calls)
+	}
+}
+
+// Cancellation must stop an API operation and remain visible to errors.Is.
+func TestCanceledRequestPreservesContextCause(t *testing.T) {
+	started := make(chan struct{})
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { close(started); <-r.Context().Done() }))
+	defer api.Close()
+	client, err := ng.NewClient("ng_test", ng.Options{BaseURL: api.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := client.Account(ctx); done <- err }()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost context cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request ignored cancellation")
+	}
+}
+
+// Reporting is anonymous and non-2xx delivery is not a success or refund.
+func TestReportDoesNotSendAPIKey(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/analytics/report" || r.Header.Get("Authorization") != "" {
+			t.Error("report used authentication or wrong route")
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["request_id"] != "request-123" {
+			t.Error("report request id was lost")
+		}
+		w.WriteHeader(503)
+	}))
+	defer api.Close()
+	client, err := ng.NewClient("ng_test", ng.Options{BaseURL: api.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	delivered, err := client.Report(context.Background(), "request-123")
+	if err != nil || delivered {
+		t.Fatalf("report falsely succeeded: %v %v", delivered, err)
 	}
 }

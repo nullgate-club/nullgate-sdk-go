@@ -6,156 +6,134 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/nullgate-club/nullgate-sdk-go/internal/profilewire"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/profilewire"
 )
 
 // Profile owns one active document connection. Ready startup is not collector
-// completion or target acceptance. Keep the context passed to Session.Profile
+// completion or target acceptance. Keep the context passed to Page.ThreatMetrix
 // alive until departure/Close, and do not copy a Profile after first use.
 type Profile struct {
 	RequestID string
 
-	session      *Session
-	target       Target
-	ctx          context.Context
-	cancel       context.CancelFunc
-	ready        chan struct{}
-	collected    chan struct{}
-	done         chan struct{}
-	writeGate    chan struct{}
-	pageGate     chan struct{}
-	workers      sync.WaitGroup
-	stopOnce     sync.Once
-	closeOnce    sync.Once
-	mu           sync.Mutex
-	conn         *websocket.Conn
-	err          error
-	pageDone     chan struct{}
-	errorFormat  bool
-	targetErrors map[int64]error
+	session   *Session
+	target    target
+	ctx       context.Context
+	cancel    context.CancelFunc
+	ready     chan struct{}
+	collected chan struct{}
+	done      chan struct{}
+	writeGate chan struct{}
+	pageGate  chan struct{}
+	workers   sync.WaitGroup
+	stopOnce  sync.Once
+	closeOnce sync.Once
+	mu        sync.Mutex
+	conn      *websocket.Conn
+	err       error
+	pageDone  chan struct{}
 }
 
 func (*Profile) String() string     { return "nullgate.Profile{Document:<redacted>, State:<redacted>}" }
 func (p *Profile) GoString() string { return p.String() }
 
-// Profile begins a ThreatMetrix document using the session's identity, user
-// agent, timezone and continuation state. It serializes startup with Solve and
-// other profile starts, then returns at ready while one background reader keeps
-// servicing HTTP and ICE. There is no reconnect or paid-profile retry.
-func (s *Session) Profile(ctx context.Context, params ThreatMetrixParams, target Target) (*Profile, error) {
+// Collector identifies a known ThreatMetrix collector.
+type Collector struct {
+	URL, OrgID, SessionID string
+}
+
+// ThreatMetrixOptions supplies the target transport and observed page data.
+type ThreatMetrixOptions struct {
+	Send      TargetFetch
+	ScriptURL string
+	Collector *Collector
+	Proxy     string
+	Inputs    []PreparedInput
+	Actions   []Action
+}
+
+// ThreatMetrix starts profiling and returns once the document is ready.
+func (page *Page) ThreatMetrix(ctx context.Context, opts ThreatMetrixOptions) (*Profile, error) {
 	if ctx == nil {
 		return nil, errors.New("nullgate: context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if target.fetch == nil || target.dial == nil {
-		return nil, errors.New("nullgate: Target must be constructed with NewTarget")
-	}
-	select {
-	case s.gate <- struct{}{}:
-		defer func() { <-s.gate }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.done:
-		return nil, ErrClosed
-	case <-s.client.done:
-		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	previous := s.document
-	closed := s.closed
-	s.mu.Unlock()
-	if closed || s.client.closed.Load() {
-		return nil, ErrClosed
-	}
-	website, err := observePage(params.Protection.Page, previous)
+	target, err := newTarget(opts.Send, opts.Proxy)
 	if err != nil {
 		return nil, err
 	}
-	if (params.Protection.TagsURL == "") == (params.Protection.collector == nil) {
-		return nil, errors.New("nullgate: ThreatMetrix requires exactly one tags URL or direct collector")
+	release, err := page.session.acquire(ctx, "threatmetrix")
+	if err != nil {
+		return nil, err
 	}
-	var tagsURL string
-	if params.Protection.collector == nil {
-		base, _ := url.Parse(website.URL)
-		reference, err := url.Parse(params.Protection.TagsURL)
+	defer release()
+	start := page.session.context("threatmetrix", page)
+	start["type"] = "start"
+	start["at_ms"] = time.Now().UnixMilli()
+	if opts.Collector != nil {
+		if opts.ScriptURL != "" {
+			return nil, newError("invalid_request", "provide either a script URL or collector")
+		}
+		c := opts.Collector
+		u, err := absoluteHTTPURL(c.URL)
+		if err != nil || u.User != nil || strings.ContainsAny(c.URL, "#\\") || strings.IndexFunc(c.URL, unicode.IsSpace) >= 0 || c.OrgID == "" || c.SessionID == "" {
+			return nil, newError("invalid_request", "invalid collector")
+		}
+		start["collector"] = profilewire.Collector{URL: c.URL, OrgID: c.OrgID, SessionID: c.SessionID}
+	} else {
+		script, err := page.script("profile", opts.ScriptURL)
 		if err != nil {
-			return nil, errors.New("nullgate: ThreatMetrix.TagsURL must be a tags.js URL with one nonempty org_id and session_id")
+			return nil, err
 		}
-		tags := base.ResolveReference(reference)
-		tags.Fragment, tags.RawFragment = "", ""
-		if !isThreatMetrixTags(tags) {
-			return nil, errors.New("nullgate: ThreatMetrix.TagsURL must be a tags.js URL with one nonempty org_id and session_id")
+		start["tags_url"] = script
+	}
+	if opts.Inputs != nil {
+		inputs, err := page.prepareInputs(opts.Inputs)
+		if err != nil {
+			return nil, err
 		}
-		tagsURL = tags.String()
+		start["inputs"] = inputs
 	}
-	var inputs *[]PreparedInput
-	if params.Inputs != nil {
-		prepared := PrepareInputs(params.Inputs)
-		inputs = &prepared
-	}
-	if err := validateActions(params.Actions); err != nil {
+	if err := validateActions(opts.Actions); err != nil {
 		return nil, err
 	}
-	var actions *[]Action
-	if params.Actions != nil {
-		actions = &params.Actions
+	if opts.Actions != nil {
+		start["actions"] = opts.Actions
 	}
-	start, err := json.Marshal(profileStart{
-		Type: "start", Website: website, TagsURL: tagsURL, Collector: params.Protection.collector, Timezone: s.timezone,
-		AtMS:   time.Now().UnixMilli(),
-		Inputs: inputs, Actions: actions,
-	})
+	data, err := json.Marshal(start)
 	if err != nil {
-		return nil, &ProtocolError{Problem: "start payload could not be JSON encoded", Operation: "profile"}
+		return nil, protocolError("start payload could not be encoded")
 	}
 	profileCtx, cancel := context.WithCancel(ctx)
-	p := &Profile{
-		session: s, target: target, ctx: profileCtx, cancel: cancel,
+	p := &Profile{session: page.session, target: target, ctx: profileCtx, cancel: cancel,
 		ready: make(chan struct{}), collected: make(chan struct{}), done: make(chan struct{}),
-		writeGate: make(chan struct{}, 1), pageGate: make(chan struct{}, 1),
-	}
-	// Register before connecting so owner Close also cancels a pending handshake.
-	s.client.profilesMu.Lock()
-	s.mu.Lock()
-	if s.closed || s.client.closed.Load() {
-		s.mu.Unlock()
-		s.client.profilesMu.Unlock()
+		writeGate: make(chan struct{}, 1), pageGate: make(chan struct{}, 1)}
+	client := page.session.client
+	client.profilesMu.Lock()
+	if client.api.Closed() {
+		client.profilesMu.Unlock()
 		cancel()
 		return nil, ErrClosed
 	}
-	stateID := s.stateID
-	s.document = website
-	if s.profiles == nil {
-		s.profiles = make(map[*Profile]struct{})
+	if client.profiles == nil {
+		client.profiles = make(map[*Profile]struct{})
 	}
-	if s.client.profiles == nil {
-		s.client.profiles = make(map[*Profile]struct{})
-	}
-	s.profiles[p] = struct{}{}
-	s.client.profiles[p] = struct{}{}
-	s.mu.Unlock()
-	s.client.profilesMu.Unlock()
-	go p.run(stateID, start)
+	client.profiles[p] = struct{}{}
+	client.profilesMu.Unlock()
+	go p.run(data)
+	timer := time.NewTimer(client.api.Timeout)
+	defer timer.Stop()
 	select {
 	case <-p.ready:
 		if err := p.Err(); err != nil {
-			<-p.done
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			p.stop(err)
 			<-p.done
 			return nil, err
 		}
@@ -166,23 +144,28 @@ func (s *Session) Profile(ctx context.Context, params ThreatMetrixParams, target
 		p.stop(ctx.Err())
 		<-p.done
 		return nil, ctx.Err()
+	case <-timer.C:
+		err := newError("timeout", "Profile startup timed out")
+		p.stop(err)
+		<-p.done
+		return nil, err
 	}
 }
 
-func (p *Profile) run(stateID string, start []byte) {
+func (p *Profile) run(start []byte) {
 	defer func() {
-		p.stop(ErrClosed)
+		if err := p.ctx.Err(); err != nil {
+			p.stop(err)
+		} else {
+			p.stop(ErrClosed)
+		}
 		p.workers.Wait()
 		p.mu.Lock()
-		p.conn, p.target, p.pageDone = nil, Target{}, nil
-		p.targetErrors = nil
+		p.conn, p.target, p.pageDone = nil, target{}, nil
 		p.mu.Unlock()
 		p.session.client.profilesMu.Lock()
 		delete(p.session.client.profiles, p)
 		p.session.client.profilesMu.Unlock()
-		p.session.mu.Lock()
-		delete(p.session.profiles, p)
-		p.session.mu.Unlock()
 		close(p.done)
 	}()
 	stopContext := context.AfterFunc(p.ctx, func() { p.stop(p.ctx.Err()) })
@@ -192,69 +175,66 @@ func (p *Profile) run(stateID string, start []byte) {
 		return
 	}
 	client := p.session.client
-	endpoint := strings.Replace(client.profileBaseURL, "https://", "wss://", 1)
+	endpoint := strings.Replace(client.api.BaseURL, "https://", "wss://", 1)
 	endpoint = strings.Replace(endpoint, "http://", "ws://", 1)
-	endpoint += "/v1/" + p.session.identity + "/profile"
-	dialer := websocket.Dialer{HandshakeTimeout: client.http.Timeout}
+	endpoint += "/threatmetrix/profile"
+	dialer := websocket.Dialer{HandshakeTimeout: client.api.Timeout}
 	// API WebSockets never adopt HTTP(S)_PROXY. Only an explicitly supplied API
 	// transport's dial/TLS settings are reused, not its proxy or cookie settings.
-	if transport, ok := client.http.Transport.(*http.Transport); ok {
+	if transport, ok := client.api.HTTP.Transport.(*http.Transport); ok {
 		dialer.NetDialContext = transport.DialContext
 		if transport.TLSClientConfig != nil {
 			dialer.TLSClientConfig = transport.TLSClientConfig.Clone()
+			// Gorilla upgrades over HTTP/1.1, even after API HTTP negotiated h2.
+			dialer.TLSClientConfig.NextProtos = []string{"http/1.1"}
 		}
 	}
 	headers := make(http.Header)
-	headers.Set("Authorization", "Bearer "+client.apiKey)
-	headers.Set("User-Agent", p.session.userAgent)
-	headers.Set("X-State-ID", stateID)
-	headers.Set("X-Nullgate-Error-Format", "1")
+	headers.Set("Authorization", "Bearer "+client.api.Key)
 	var conn *websocket.Conn
 	var response *http.Response
 	var err error
 	for attempt := 0; ; attempt++ {
-		p.session.mu.Lock()
-		closed := p.session.closed
-		p.session.mu.Unlock()
-		if closed || client.closed.Load() {
-			p.stop(ErrClosed)
-			return
-		}
 		conn, response, err = dialer.DialContext(p.ctx, endpoint, headers)
-		if err == nil {
+		if err == nil || response == nil || response.Body == nil {
 			break
 		}
-		delay, retry := maintenanceDelay(response)
-		if !retry || attempt == 2 {
-			break
-		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		response.Body.Close()
-		if waitErr := p.session.waitMaintenance(p.ctx, delay); waitErr != nil {
-			p.stop(waitErr)
-			return
+		var failure Error
+		valid := readErr == nil && json.Unmarshal(body, &failure) == nil && failure.Code != "" && failure.Message != "" && failure.RequestID != ""
+		delay, retry := profileRetryDelay(response.Header.Get("Retry-After"))
+		if valid && failure.Code == "maintenance" && retry && attempt < 2 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				continue
+			case <-p.ctx.Done():
+				timer.Stop()
+				p.stop(p.ctx.Err())
+				return
+			}
 		}
+		if !valid {
+			failure = *protocolError("Profile handshake rejected")
+		}
+		failure.Status = response.StatusCode
+		p.stop(&failure)
+		return
 	}
 	if err != nil {
 		if p.ctx.Err() != nil {
 			p.stop(p.ctx.Err())
 		} else if response != nil && response.StatusCode >= 400 {
-			requestID := response.Header.Get("X-Request-ID")
-			if _, err := uuid.Parse(requestID); err != nil {
-				requestID = ""
-			}
-			var body []byte
-			if response.Body != nil {
-				body, _ = io.ReadAll(response.Body)
-				response.Body.Close()
-			}
-			failure := responseError(response, body)
-			failure.RequestID = requestID
+			failure := protocolError("Profile handshake rejected")
+			failure.Status = response.StatusCode
 			p.stop(failure)
 		} else {
-			p.stop(&TransportError{Operation: "profile", Err: err})
+			p.stop(&Error{Code: "transport_error", Message: "Profile connection failed", Cause: err})
 		}
 		return
 	}
+
 	p.mu.Lock()
 	p.conn = conn
 	stopped := p.err != nil
@@ -267,6 +247,22 @@ func (p *Profile) run(stateID string, start []byte) {
 		return
 	}
 	p.stop(p.readMessages())
+}
+func profileRetryDelay(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds >= 0 && seconds <= 86400 {
+		return time.Duration(seconds * float64(time.Second)), true
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		delay := time.Until(at)
+		if delay < 0 {
+			delay = 0
+		}
+		return delay, true
+	}
+	return 0, false
 }
 
 // Done closes only after the connection and all owned network work have stopped.
@@ -295,14 +291,17 @@ func (p *Profile) WaitCollected(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := p.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-p.collected:
-		return nil
+		return p.Err()
 	default:
 	}
 	select {
 	case <-p.collected:
-		return nil
+		return p.Err()
 	case <-p.ctx.Done():
 		return p.Err()
 	case <-ctx.Done():
@@ -335,6 +334,9 @@ func (p *Profile) Pagehide(ctx context.Context, atMS *int64, persisted bool) err
 	at := time.Now().UnixMilli()
 	if atMS != nil {
 		at = *atMS
+	}
+	if at < 0 {
+		return newError("invalid_request", "pagehide time must be nonnegative")
 	}
 	ack := make(chan struct{})
 	p.mu.Lock()
@@ -405,10 +407,10 @@ func (p *Profile) stop(err error) {
 	})
 }
 
-func (p *Profile) protocolError(problem string) *ProtocolError {
+func (p *Profile) protocolError(problem string) *Error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return &ProtocolError{Problem: problem, Operation: "profile", RequestID: p.RequestID}
+	return &Error{Code: "protocol_error", Message: problem, RequestID: p.RequestID}
 }
 
 func (p *Profile) send(ctx context.Context, message any) error {
@@ -437,7 +439,7 @@ func (p *Profile) send(ctx context.Context, message any) error {
 		deadline = value
 	}
 	if err := conn.SetWriteDeadline(deadline); err != nil {
-		failure := &TransportError{Operation: "profile", RequestID: requestID, Err: err}
+		failure := &Error{Code: "transport_error", Message: "Profile connection failed", RequestID: requestID, Cause: err}
 		p.stop(failure)
 		return failure
 	}
@@ -452,7 +454,7 @@ func (p *Profile) send(ctx context.Context, message any) error {
 			p.stop(ctx.Err())
 			return ctx.Err()
 		}
-		failure := &TransportError{Operation: "profile", RequestID: requestID, Err: err}
+		failure := &Error{Code: "transport_error", Message: "Profile connection failed", RequestID: requestID, Cause: err}
 		p.stop(failure)
 		return failure
 	}

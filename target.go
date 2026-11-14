@@ -5,9 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"strings"
 
-	"github.com/nullgate-club/nullgate-sdk-go/internal/profilewire"
-	"github.com/nullgate-club/nullgate-sdk-go/internal/turn"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/profilewire"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/turn"
 	"golang.org/x/net/http/httpguts"
 )
 
@@ -55,30 +56,20 @@ func (r TargetResponse) GoString() string { return r.String() }
 // HTTP error statuses are responses; connection failures are returned as errors.
 type TargetFetch func(ctx context.Context, request TargetRequest) (TargetResponse, error)
 
-// Target keeps the target's HTTP provider and TURN route local to the caller.
-// Construct it with NewTarget so a proxy/direct choice is explicit and validated
-// before a paid profile begins. It does not own or close the HTTP provider.
-type Target struct {
+type target struct {
 	fetch TargetFetch
 	dial  func(context.Context, string, string) (net.Conn, error)
 }
 
-func (Target) String() string     { return "nullgate.Target{Fetch:<redacted>, Proxy:<redacted>}" }
-func (t Target) GoString() string { return t.String() }
-
-// NewTarget accepts an explicit proxy URL or "" for direct TURN/TCP. Supported
-// proxies are socks5, socks5h, http and https. Fetch must already use the same
-// chosen network route. Neither proxy settings nor credentials reach Nullgate,
-// and a failed proxy never falls back to a direct connection.
-func NewTarget(fetch TargetFetch, proxyURL string) (Target, error) {
+func newTarget(fetch TargetFetch, proxyURL string) (target, error) {
 	if fetch == nil {
-		return Target{}, errors.New("nullgate: Target requires a fetch callback")
+		return target{}, newError("invalid_request", "target requires a fetch callback")
 	}
 	dial, err := turn.NewDialer(proxyURL)
 	if err != nil {
-		return Target{}, err
+		return target{}, newError("invalid_request", "invalid target proxy")
 	}
-	return Target{fetch: fetch, dial: dial}, nil
+	return target{fetch: fetch, dial: dial}, nil
 }
 
 func targetRequest(request *profilewire.HTTPRequest) (TargetRequest, error) {
@@ -92,6 +83,9 @@ func targetRequest(request *profilewire.HTTPRequest) (TargetRequest, error) {
 	}
 	for name, value := range request.Headers {
 		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			return TargetRequest{}, invalid
+		}
+		if credentials == CredentialsOmit && (strings.EqualFold(name, "cookie") || strings.EqualFold(name, "cookie2")) {
 			return TargetRequest{}, invalid
 		}
 	}

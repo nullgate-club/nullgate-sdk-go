@@ -7,7 +7,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/nullgate-club/nullgate-sdk-go/internal/turn"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/internal/turn"
 )
 
 type Command struct {
@@ -21,10 +21,9 @@ type Collector struct {
 }
 
 type Hello struct {
-	Type        string `json:"type"`
-	StateID     string `json:"state_id"`
-	RequestID   string `json:"request_id"`
-	ErrorFormat int    `json:"error_format,omitempty"`
+	Type      string `json:"type"`
+	Session   string `json:"session"`
+	RequestID string `json:"request_id"`
 }
 
 type Notice struct {
@@ -39,11 +38,10 @@ type Pagehide struct {
 }
 
 type ServiceError struct {
-	Type      string          `json:"type"`
-	Status    int             `json:"status"`
-	Detail    json.RawMessage `json:"detail"`
-	RequestID string          `json:"request_id"`
-	Error     json.RawMessage `json:"error,omitempty"`
+	Type      string `json:"type"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	RequestID string `json:"request_id"`
 }
 
 type HTTPRequest struct {
