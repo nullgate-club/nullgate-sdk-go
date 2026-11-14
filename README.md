@@ -207,4 +207,6 @@ examples/         Runnable caller-owned target flows
 
 Version 2 is a clean replacement for the SDK in the `v1` branch, not a drop-in upgrade. Change imports to `github.com/nullgate-club/nullgate-sdk-go/v2` and migrate callers to the v2 API. The root package has no session, options, error, or model aliases.
 
+If you used the initial flat v2 API, replace `nullgate.NewClient` with `nullgate.New` and use `api.Options` and `api.Error`. Replace `client.Session` and page-level product methods with a browser visit and product sessions, as shown above. The flat API has no compatibility aliases.
+
 CI runs `make setup` followed by `make check` with Go 1.24.1 or newer. See [sessions](https://nullgate.club/en/sessions) and [errors](https://nullgate.club/en/errors) for more details.
