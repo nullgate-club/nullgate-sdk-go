@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://nullgate.club/assets/avatar.svg" alt="Nullgate" width="120">
+<img src="assets/readme.svg" alt="Nullgate" width="100%">
 
 # Nullgate Go SDK 2
 
