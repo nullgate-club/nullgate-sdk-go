@@ -14,6 +14,61 @@ import (
 	"github.com/nullgate-club/nullgate-sdk-go/v2/browser"
 )
 
+// Ordinary pixel calls must omit iframe for compatibility with older servers.
+func TestPixelIframe(t *testing.T) {
+	tests := []struct {
+		name string
+		opts akamai.PixelOptions
+		want bool
+	}{
+		{name: "omitted", opts: akamai.PixelOptions{ScriptURL: "/pixel", Script: "pixel", Challenge: "123"}},
+		{name: "iframe", opts: akamai.PixelOptions{ScriptURL: "/pixel", Script: "pixel", Challenge: "123"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bodies := make(chan map[string]any, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				bodies <- body
+				io.WriteString(w, `{"session":"state-1","request_id":"request-1","request":{"url":"https://example.com/submit","body":"pixel","headers":{},"send_at":0}}`)
+			}))
+			defer server.Close()
+			client, err := api.New("ng_test", api.Options{BaseURL: server.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			visit, err := browser.New(browser.Options{UserAgent: "test browser"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := akamai.New(client).Session(visit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, err := visit.Page("https://example.com/", "", browser.PageOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			generate := session.Pixel
+			if tt.want {
+				generate = session.PixelIframe
+			}
+			if _, err := generate(context.Background(), page, tt.opts); err != nil {
+				t.Fatal(err)
+			}
+			value, present := (<-bodies)["iframe"]
+			if present != tt.want || (tt.want && value != true) {
+				t.Fatalf("iframe = %v, present = %v; want true present = %v", value, present, tt.want)
+			}
+		})
+	}
+}
+
 // A moved continuation must recover its retained sensor script without leaking input values.
 func TestSensorRetentionRecoveryAndPrivacy(t *testing.T) {
 	bodies := make(chan map[string]any, 8)

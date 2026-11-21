@@ -166,6 +166,17 @@ Create an immutable browser identity with `browser.New(browser.Options{UserAgent
 
 `akamai.SensorURL(page)`, `akamai.PixelURL(page)`, and `akamai.SbsdURL(page)` discover script URLs. An empty result means none was found, and ambiguous discovery returns an error. Supply an explicit script URL when needed. Use `session.Sensor(ctx, page, akamai.SensorOptions{...})`, `session.Pixel(ctx, page, akamai.PixelOptions{...})`, or `session.Sbsd(ctx, page, akamai.SbsdOptions{...})`.
 
+For a pixel running in a hidden restricted cross-origin frame, use `PixelIframe`:
+
+```go
+request, err := session.PixelIframe(ctx, page, akamai.PixelOptions{
+	Script:    pixelScript,
+	ScriptURL: pixelURL,
+})
+```
+
+`PixelIframe` requires a server that supports the pixel `iframe` field. Ordinary `Pixel` calls omit it and remain compatible with older servers.
+
 `page.Inputs` matches ordinary raw values by control ID or name and summarizes them locally. It rejects passwords. For passwords, use `browser.PrepareInputs([]browser.Input{...})` explicitly with an input's ID or name and value. It returns `browser.PreparedInput` values without retaining the raw value. Do not put passwords in logs, attributes, selectors, or FWCIM extras. Optional input and action slices distinguish `nil` (omitted) from an empty slice (explicitly empty).
 
 For FWCIM, create and reuse `client.Amazon.Session(visit)` and call `session.Fwcim(ctx, page, amazon.FwcimOptions{...})`. Use `amazon.PrepareInputs(page, []browser.Input{...})` before discarding raw values. It returns `amazon.Input` values, which embed browser summaries and add FWCIM-only metadata. It computes source-compatible CRC32 checksums and includes email text for the canvas probe. It never includes password text or password checksums. Precomputed nonempty submitted nonpassword observations require `Checksum`, and the selected email also requires `Text`. Supply observed `Timing` with `navigationStart` in Unix milliseconds. If `browser.PageOptions.StartedAtMS` is set, it must match. Supply `amazon.Input.Geometry` only when measured. Wait on the result before submitting `Metadata1` with the original form and its target cookies.

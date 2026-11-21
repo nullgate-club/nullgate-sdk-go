@@ -49,6 +49,15 @@ func (s *Session) Sensor(ctx context.Context, p *browser.Page, opts SensorOption
 
 // Pixel generates a caller-owned pixel request.
 func (s *Session) Pixel(ctx context.Context, p *browser.Page, opts PixelOptions) (*Request, error) {
+	return s.pixel(ctx, p, opts, false)
+}
+
+// PixelIframe generates a pixel for a hidden restricted cross-origin frame.
+func (s *Session) PixelIframe(ctx context.Context, p *browser.Page, opts PixelOptions) (*Request, error) {
+	return s.pixel(ctx, p, opts, true)
+}
+
+func (s *Session) pixel(ctx context.Context, p *browser.Page, opts PixelOptions, iframe bool) (*Request, error) {
 	if err := s.validate(ctx, p); err != nil {
 		return nil, err
 	}
@@ -59,7 +68,11 @@ func (s *Session) Pixel(ctx context.Context, p *browser.Page, opts PixelOptions)
 	if opts.Script == "" {
 		return nil, failure("invalid_request", "script must not be empty")
 	}
-	return s.generate(ctx, p, "pixel", map[string]any{"script_url": url, "script": opts.Script, "challenge": challenge}, "")
+	fields := map[string]any{"script_url": url, "script": opts.Script, "challenge": challenge}
+	if iframe {
+		fields["iframe"] = true
+	}
+	return s.generate(ctx, p, "pixel", fields, "")
 }
 
 // Sbsd generates a caller-owned SBSD request.
