@@ -10,7 +10,9 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -38,6 +40,29 @@ func (c *Client) GoString() string       { return c.String() }
 func (c *Client) Done() <-chan struct{}  { return c.done }
 func (c *Client) Closed() bool           { return c.closed.Load() }
 func (c *Client) Timeout() time.Duration { return c.timeout }
+
+// CheckTargetCredentials rejects the API key in a target URL or header names and values.
+// It does not expose the key in its error.
+func (c *Client) CheckTargetCredentials(targetURL string, headers http.Header) error {
+	if c.key == "" {
+		return nil
+	}
+	decoded, _ := url.QueryUnescape(targetURL)
+	if strings.Contains(targetURL, c.key) || strings.Contains(decoded, c.key) {
+		return ProtocolError("Target request contains API credentials")
+	}
+	for name, values := range headers {
+		if strings.Contains(name, c.key) {
+			return ProtocolError("Target request contains API credentials")
+		}
+		for _, value := range values {
+			if strings.Contains(value, c.key) {
+				return ProtocolError("Target request contains API credentials")
+			}
+		}
+	}
+	return nil
+}
 func (c *Client) Close() error {
 	if c.closed.Swap(true) {
 		return nil

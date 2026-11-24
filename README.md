@@ -20,6 +20,7 @@ The SDK calls the Nullgate API and prepares requests for target sites. You own t
 | Amazon FWCIM | `amazon.Session.Fwcim` returns `metadata1` for the original form | [Amazon](https://nullgate.club/en/amazon) |
 | Amazon ACIC | `client.Amazon.ACIC.Pow`, `Waf` | [ACIC](https://nullgate.club/en/amazon-acic) |
 | ThreatMetrix | `threatmetrix.Session.Start` starts a profiling session | [ThreatMetrix](https://nullgate.club/en/threatmetrix) |
+| PingOne Protect | `pingone.Session.Protect` | [PingOne Protect](https://nullgate.club/en/pingone) |
 | Classifier | `client.Classifier.Classify`, `Match` | [Classifier](https://nullgate.club/en/classifier) |
 
 ## Quick start
@@ -185,6 +186,8 @@ For ACIC, use `acic.Discover`, `acic.ParseResult`, and `acic.DiscoverWaf` from `
 
 For ThreatMetrix, create and reuse `client.ThreatMetrix.Session(visit)`, then call `session.Start(ctx, page, threatmetrix.Options{...})`. Provide the target fetch callback and keep the startup context alive for the profile lifetime. `WaitCollected` waits for collection, `Pagehide` signals departure, and `Close` stops the profile. Ready startup alone does not mean collection or target acceptance.
 
+For PingOne Protect, fetch the page and its actual PingOne SDK script with your target client. Create `client.PingOne.Session(visit)` and call `session.Protect(ctx, page, pingone.Options{Script: script, Send: target.Do})`. Submit `result.Data` in the site's normal flow. The [PingOne example](examples/pingone/main.go) shows the callback. Use the same target client and cookie jar throughout. Protect costs $0.50 per 1,000 successful results. Prepare is free. Target acceptance is not guaranteed.
+
 ## Transport and reporting
 
 `api.Options.HTTPClient` configures only calls to the Nullgate API. It does not send target requests. The SDK copies the client and disables its cookies and redirects. Keep target cookies and proxy settings in your own client. `net/http` does not preserve wire header order. Use a suitable caller-owned transport if your target requires it.
@@ -208,6 +211,7 @@ browser/          Browser identity, pages, and input summaries
 akamai/           Akamai sessions and requests
 amazon/           FWCIM sessions and input metadata
 amazon/acic/      ACIC discovery and PoW/WAF
+pingone/          PingOne Protect sessions and target token requests
 threatmetrix/     ThreatMetrix sessions and profiles
 classifier/       Image classification and matching
 internal/         Private protocol, parsing, and transport support

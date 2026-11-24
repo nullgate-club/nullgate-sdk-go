@@ -10,6 +10,7 @@ import (
 	"github.com/nullgate-club/nullgate-sdk-go/v2/amazon"
 	"github.com/nullgate-club/nullgate-sdk-go/v2/api"
 	"github.com/nullgate-club/nullgate-sdk-go/v2/classifier"
+	"github.com/nullgate-club/nullgate-sdk-go/v2/pingone"
 	"github.com/nullgate-club/nullgate-sdk-go/v2/threatmetrix"
 )
 
@@ -19,6 +20,7 @@ type Client struct {
 	Akamai       *akamai.Client
 	Amazon       *amazon.Client
 	ThreatMetrix *threatmetrix.Client
+	PingOne      *pingone.Client
 	Classifier   *classifier.Client
 	connection   *api.Client
 }
@@ -35,7 +37,7 @@ func New(key string, options api.Options) (*Client, error) {
 	return &Client{
 		Accounts: accounts.New(connection), Akamai: akamai.New(connection),
 		Amazon: amazon.New(connection), ThreatMetrix: threatmetrix.New(connection),
-		Classifier: classifier.New(connection), connection: connection,
+		Classifier: classifier.New(connection), PingOne: pingone.New(connection), connection: connection,
 	}, nil
 }
 
