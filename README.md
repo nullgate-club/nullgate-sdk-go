@@ -4,7 +4,7 @@
 
 # Nullgate Go SDK 2
 
-**Prepare protection requests. Your HTTP client sends them.**
+**Solve target visits through a local HTTP API, or use the advanced request API.**
 
 [![Go 1.24.1+](https://img.shields.io/badge/Go-1.24.1%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Docs](https://img.shields.io/badge/docs-nullgate.club-56856a)](https://nullgate.club)
@@ -12,7 +12,75 @@
 
 </div>
 
-The SDK calls the Nullgate API and prepares requests for target sites. You own target HTTP, cookies, proxies, and submission.
+## Quick start
+
+Start the [local HTTP API](https://github.com/nullgate-club/http-api) once. Enter your API key at its prompt, or set `NULLGATE_API_KEY` for the server.
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh && "$HOME/.local/bin/uvx" --python 3.11 --from "nullgate-http-api @ https://github.com/nullgate-club/http-api/archive/refs/heads/main.tar.gz" nullgate-http-api
+```
+
+Install the Go SDK in your module:
+
+```sh
+GOPROXY=direct go get github.com/nullgate-club/nullgate-sdk-go/v2@main
+```
+
+Call the local server with your target URL, user agent, optional proxy, and session name:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+
+    "github.com/nullgate-club/nullgate-sdk-go/v2/solver"
+)
+
+func main() {
+    client, err := solver.New(solver.Options{})
+    if err != nil { log.Fatal(err) }
+    result, err := client.Solve(context.Background(), solver.Request{
+        Type: solver.Akamai,
+        URL: os.Getenv("TARGET_URL"),
+        UserAgent: os.Getenv("TARGET_USER_AGENT"),
+        Proxy: os.Getenv("TARGET_PROXY"),
+        Session: "my-visit",
+    })
+    if err != nil { log.Fatal(err) }
+    fmt.Printf("Received %d cookies\n", len(result.Cookies))
+    // Apply result.Cookies to your target client and use the same user agent and proxy.
+}
+```
+
+The server defaults to `http://127.0.0.1:8191`. The Go client does not need an API key.
+The default client timeout is 190 seconds. Set `solver.Options.HTTPClient` to use your own client.
+The caller owns that client. Pass a context to cancel a solve. The SDK does not retry solves.
+
+Use `solver.ThreatMetrix`, `solver.PingOne`, or `solver.AmazonACIC` for other products.
+`result.Result` holds typed product fields. For example, PingOne returns `result.Result.Data`.
+`result.RawResult` preserves the complete product JSON. Cookies retain domain, path, expiry, and other attributes.
+Named sessions retain cookies and pin the user agent, proxy, and transport. Omitted settings reuse the session settings.
+Pass an empty cookie slice to clear a session's externally updated cookie snapshot.
+Set `Transport` for browser emulation, native TLS and HTTP/2 options, or header order.
+See the [HTTP API guide](https://github.com/nullgate-club/http-api) for available options.
+
+Run the [example](examples/solve/main.go) from a checkout:
+
+```sh
+export TARGET_URL='https://your-target.example/'
+export TARGET_USER_AGENT='your actual browser user agent'
+export TARGET_PROXY='http://your-proxy:8080' # optional
+export TARGET_SESSION='my-visit' # optional
+go run ./examples/solve
+```
+
+## Advanced
+
+The advanced SDK calls the Nullgate API and prepares requests for target sites. You own target HTTP, cookies, proxies, and submission.
 
 | Product | Methods | Guide |
 |---|---|---|
@@ -23,7 +91,7 @@ The SDK calls the Nullgate API and prepares requests for target sites. You own t
 | PingOne Protect | `pingone.Session.Protect` | [PingOne Protect](https://nullgate.club/en/pingone) |
 | Classifier | `client.Classifier.Classify`, `Match` | [Classifier](https://nullgate.club/en/classifier) |
 
-## Quick start
+### Advanced quick start
 
 Get an API key from [@nullgate_app](https://t.me/nullgate_app). Install the SDK into your Go module:
 
